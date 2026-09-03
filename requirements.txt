@@ -1,4 +1,5 @@
-# Time frame: Daily / Full Day Opening Gap
+# Time frame: Daily / Pre-Open Opening Gap
 flask
-yfinance
+requests
+pandas
 gunicorn
