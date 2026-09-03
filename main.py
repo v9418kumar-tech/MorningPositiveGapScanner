@@ -1,540 +1,525 @@
-# Time frame: NSE Pre-Open / 9:08-9:09 AM
-# Scanner: Positive Opening Gap + Previous 20-Day Real Turnover
-# Today Close is NOT used anywhere.
+# Time frame: Daily historical liquidity + NSE Pre-Open
 
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request
 import requests
-import csv
-import io
-import os
-import time
+import pandas as pd
+from io import StringIO
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------
-# NSE URLs
-# ---------------------------------------------------------
+NSE_PREOPEN_URL = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
+NSE_ETF_URL = "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv"
+NSE_BHAV_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{}.csv"
 
-NSE_HOME = "https://www.nseindia.com/"
-NSE_PREOPEN = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
-
-NSE_BHAV = (
-    "https://nsearchives.nseindia.com/"
-    "products/content/sec_bhavdata_full_{}.csv"
-)
-
-NSE_ETF = (
-    "https://nsearchives.nseindia.com/"
-    "content/equities/eq_etfseclist.csv"
-)
-
-# ---------------------------------------------------------
-# Scanner Conditions
-# ---------------------------------------------------------
-
-MIN_PRICE = 20.0
+MIN_PRICE = 20
 MIN_GAP = 1.0
+MIN_AVG_TURNOVER = 100000000   # ₹10 crore
+LIQUIDITY_DAYS = 20
 
-# ₹10 Crore
-MIN_AVG_TURNOVER = 100000000
-
-HISTORICAL_DAYS_REQUIRED = 20
-
-# ---------------------------------------------------------
-# NSE Session
-# ---------------------------------------------------------
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "application/json,text/plain,*/*"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
-    "Origin": "https://www.nseindia.com",
-    "Connection": "keep-alive",
-    "Cache-Control": "no-cache",
-}
-
-session = requests.Session()
-session.headers.update(HEADERS)
+# In-memory cache
+liquidity_cache = {}
+liquidity_cache_date = None
+cache_lock = threading.Lock()
 
 
-# ---------------------------------------------------------
-# Utility
-# ---------------------------------------------------------
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Morning Positive Gap Scanner</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
 
-def clean_number(value):
-    try:
-        if value is None:
-            return 0.0
+    <style>
+        body {
+            background:#121212;
+            color:#eeeeee;
+            font-family:Arial,sans-serif;
+            margin:0;
+            padding:20px;
+        }
 
-        text = str(value).strip()
-        text = text.replace(",", "")
-        text = text.replace("₹", "")
+        .container {
+            max-width:1100px;
+            margin:auto;
+        }
 
-        if text in ("", "-", "None", "nan", "NaN"):
-            return 0.0
+        h1 {
+            font-size:24px;
+            margin-bottom:8px;
+        }
 
-        return float(text)
+        .info {
+            background:#1e1e1e;
+            padding:14px;
+            border-radius:8px;
+            margin-bottom:15px;
+            line-height:1.6;
+        }
 
-    except Exception:
-        return 0.0
+        button {
+            background:#333333;
+            color:white;
+            border:1px solid #555;
+            padding:13px 22px;
+            border-radius:7px;
+            font-size:16px;
+            cursor:pointer;
+            margin-bottom:18px;
+        }
+
+        button:hover {
+            background:#444444;
+        }
+
+        .status {
+            margin-bottom:15px;
+            font-size:15px;
+        }
+
+        .table-wrap {
+            overflow-x:auto;
+        }
+
+        table {
+            width:100%;
+            border-collapse:collapse;
+            background:#1a1a1a;
+        }
+
+        th {
+            background:#252525;
+            padding:11px 8px;
+            text-align:center;
+            white-space:nowrap;
+        }
+
+        td {
+            padding:10px 8px;
+            border-bottom:1px solid #333;
+            text-align:center;
+            white-space:nowrap;
+        }
+
+        .gap {
+            color:#00d26a;
+            font-weight:bold;
+        }
+
+        .note {
+            color:#aaaaaa;
+            font-size:13px;
+            margin-top:15px;
+        }
+    </style>
+</head>
+
+<body>
+<div class="container">
+
+    <h1>Morning Positive Gap Scanner</h1>
+
+    <div class="info">
+        <b>Conditions:</b><br>
+        NSE Equity only<br>
+        ETF excluded<br>
+        Opening Price &gt; ₹20<br>
+        Opening Gap ≥ 1%<br>
+        Previous 20 trading days average real turnover &gt; ₹10 crore<br>
+        Results sorted by highest Gap %
+    </div>
+
+    <form action="/scan" method="get">
+        <button type="submit">RUN SCANNER</button>
+    </form>
+
+    {% if status %}
+        <div class="status">{{ status }}</div>
+    {% endif %}
+
+    {% if rows %}
+    <div class="table-wrap">
+        <table>
+            <tr>
+                <th>Rank</th>
+                <th>Stock</th>
+                <th>Symbol</th>
+                <th>Gap %</th>
+                <th>Opening Price</th>
+                <th>Previous Close</th>
+                <th>20D Avg Turnover</th>
+            </tr>
+
+            {% for r in rows %}
+            <tr>
+                <td>{{ r.rank }}</td>
+                <td>{{ r.name }}</td>
+                <td>{{ r.symbol }}</td>
+                <td class="gap">{{ "%.2f"|format(r.gap) }}%</td>
+                <td>₹{{ "%.2f"|format(r.open) }}</td>
+                <td>₹{{ "%.2f"|format(r.prev_close) }}</td>
+                <td>₹{{ "{:,.0f}".format(r.avg_turnover) }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    {% endif %}
+
+    <div class="note">
+        Opening Gap = (Opening Price − Previous Close) ÷ Previous Close × 100.
+        Today's Close is not used for the Opening Gap calculation.
+    </div>
+
+</div>
+</body>
+</html>
+"""
 
 
-def clean_key(key):
-    if key is None:
-        return ""
+def nse_session():
+    session = requests.Session()
 
-    return str(key).strip().upper()
-
-
-# ---------------------------------------------------------
-# NSE Session Warm-up
-# ---------------------------------------------------------
-
-def warm_nse_session():
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive"
+    })
 
     try:
         session.get(
-            NSE_HOME,
+            "https://www.nseindia.com/",
+            timeout=10
+        )
+    except Exception:
+        pass
+
+    return session
+
+
+def get_etf_symbols():
+    try:
+        s = nse_session()
+
+        r = s.get(
+            NSE_ETF_URL,
             timeout=20
         )
 
-        time.sleep(0.5)
+        if r.status_code != 200:
+            return set()
 
-        return True
+        text = r.text.strip()
 
-    except Exception:
-        return False
+        if not text:
+            return set()
 
+        df = pd.read_csv(StringIO(text))
 
-# ---------------------------------------------------------
-# ETF Symbols
-# ---------------------------------------------------------
+        symbols = set()
 
-def get_etf_symbols():
+        for col in df.columns:
+            if "symbol" in str(col).lower():
+                for value in df[col].dropna():
+                    symbols.add(str(value).strip().upper())
 
-    try:
-
-        response = session.get(
-            NSE_ETF,
-            timeout=30
-        )
-
-        response.raise_for_status()
-
-        reader = csv.DictReader(
-            io.StringIO(response.text)
-        )
-
-        etf_symbols = set()
-
-        for row in reader:
-
-            for key, value in row.items():
-
-                if not value:
-                    continue
-
-                if "SYMBOL" in clean_key(key):
-
-                    symbol = value.strip().upper()
-
-                    if symbol:
-                        etf_symbols.add(symbol)
-
-        return etf_symbols
+        return symbols
 
     except Exception:
-
         return set()
 
 
-# ---------------------------------------------------------
-# Find value from row using possible column names
-# ---------------------------------------------------------
-
-def get_row_value(row, possible_names):
-
-    normalized = {}
-
-    for key, value in row.items():
-
-        normalized[
-            clean_key(key).replace(" ", "")
-        ] = value
-
-    for name in possible_names:
-
-        normalized_name = (
-            name.upper()
-            .replace(" ", "")
-        )
-
-        if normalized_name in normalized:
-            return normalized[normalized_name]
-
-    return ""
-
-
-# ---------------------------------------------------------
-# Previous 20 completed trading days
-#
-# REAL TURNOVER:
-# Prefer NSE TOTTRDVAL.
-#
-# If unavailable, fallback:
-# CLOSE PRICE × TOTAL TRADED QUANTITY
-# ---------------------------------------------------------
-
-def get_previous_20_day_turnover():
-
-    today = datetime.now().date()
-
-    candidate_dates = []
-
-    # Search enough calendar days to find
-    # 20 completed trading days.
-    for i in range(1, 60):
-
-        d = today - timedelta(days=i)
-
-        if d.weekday() < 5:
-            candidate_dates.append(d)
-
-        if len(candidate_dates) >= 30:
-            break
-
-    # We need only the most recent 20 completed days.
-    target_dates = candidate_dates[:20]
-
-    turnover_by_symbol = {}
-
-    def download_one_day(day):
-
-        date_text = day.strftime("%d%m%Y")
-
-        url = NSE_BHAV.format(date_text)
-
-        try:
-
-            response = session.get(
-                url,
-                timeout=30
-            )
-
-            if response.status_code != 200:
-                return day, []
-
-            text = response.text
-
-            if not text.strip():
-                return day, []
-
-            reader = csv.DictReader(
-                io.StringIO(text)
-            )
-
-            day_data = []
-
-            for row in reader:
-
-                symbol = get_row_value(
-                    row,
-                    [
-                        "SYMBOL"
-                    ]
-                ).strip().upper()
-
-                series = get_row_value(
-                    row,
-                    [
-                        "SERIES"
-                    ]
-                ).strip().upper()
-
-                if not symbol:
-                    continue
-
-                # NSE Equity only
-                if series != "EQ":
-                    continue
-
-                # Actual traded value
-                actual_turnover = clean_number(
-                    get_row_value(
-                        row,
-                        [
-                            "TOTTRDVAL",
-                            "TOTALTRADEDVALUE",
-                            "TRADEDVALUE"
-                        ]
-                    )
-                )
-
-                # Fallback if actual turnover column
-                # is not available.
-                if actual_turnover <= 0:
-
-                    close_price = clean_number(
-                        get_row_value(
-                            row,
-                            [
-                                "CLOSE_PRICE",
-                                "CLOSE"
-                            ]
-                        )
-                    )
-
-                    quantity = clean_number(
-                        get_row_value(
-                            row,
-                            [
-                                "TTL_TRD_QNTY",
-                                "TOTALTRADEDQUANTITY",
-                                "TOTTRDQTY"
-                            ]
-                        )
-                    )
-
-                    if (
-                        close_price > 0
-                        and quantity > 0
-                    ):
-                        actual_turnover = (
-                            close_price * quantity
-                        )
-
-                if actual_turnover > 0:
-
-                    day_data.append(
-                        (
-                            symbol,
-                            actual_turnover
-                        )
-                    )
-
-            return day, day_data
-
-        except Exception:
-
-            return day, []
-
-    # Download the 20 dates.
-    with ThreadPoolExecutor(
-        max_workers=5
-    ) as executor:
-
-        futures = [
-            executor.submit(
-                download_one_day,
-                day
-            )
-            for day in target_dates
-        ]
-
-        for future in as_completed(futures):
-
-            day, rows = future.result()
-
-            for symbol, turnover in rows:
-
-                if symbol not in turnover_by_symbol:
-
-                    turnover_by_symbol[symbol] = []
-
-                turnover_by_symbol[symbol].append(
-                    (
-                        day,
-                        turnover
-                    )
-                )
-
-    # -----------------------------------------------------
-    # Calculate exact average over 20 completed days.
-    # -----------------------------------------------------
-
-    average_turnover = {}
-
-    for symbol, values in turnover_by_symbol.items():
-
-        # Sort newest completed day first
-        values.sort(
-            key=lambda x: x[0],
-            reverse=True
-        )
-
-        # Exactly the 20 requested days
-        last_20 = values[:20]
-
-        if len(last_20) == 20:
-
-            total = sum(
-                turnover
-                for _, turnover in last_20
-            )
-
-            average_turnover[symbol] = (
-                total / 20.0
-            )
-
-    return average_turnover
-
-
-# ---------------------------------------------------------
-# NSE Pre-Open Data
-# ---------------------------------------------------------
-
 def get_preopen_data():
-
-    warm_nse_session()
-
-    last_error = ""
+    last_error = None
 
     for attempt in range(3):
 
         try:
+            s = nse_session()
 
-            response = session.get(
-                NSE_PREOPEN,
-                timeout=30
+            r = s.get(
+                NSE_PREOPEN_URL,
+                timeout=20
             )
 
-            if response.status_code == 200:
+            if r.status_code != 200:
+                raise Exception(
+                    f"NSE HTTP {r.status_code}"
+                )
 
-                return response.json()
+            data = r.json()
 
-            last_error = (
-                "NSE HTTP "
-                + str(response.status_code)
-            )
+            if "data" not in data:
+                raise Exception("NSE pre-open data missing")
+
+            return data["data"]
 
         except Exception as e:
-
-            last_error = str(e)
-
-        time.sleep(2)
-
-        warm_nse_session()
+            last_error = e
+            time.sleep(1)
 
     raise Exception(
-        "NSE Pre-Open data unavailable. "
-        + last_error
+        f"NSE Pre-Open failed: {last_error}"
     )
 
 
-# ---------------------------------------------------------
-# Extract symbol / price fields from NSE response
-# ---------------------------------------------------------
+def find_column(df, possible_names):
 
-def extract_possible_value(
-    dictionaries,
-    possible_keys
-):
+    lower_map = {
+        str(c).strip().lower(): c
+        for c in df.columns
+    }
 
-    for data in dictionaries:
-
-        if not isinstance(data, dict):
-            continue
-
-        for key in possible_keys:
-
-            if key in data:
-
-                value = data.get(key)
-
-                if value not in (
-                    None,
-                    "",
-                    "-"
-                ):
-
-                    return value
+    for name in possible_names:
+        if name.lower() in lower_map:
+            return lower_map[name.lower()]
 
     return None
 
 
-def extract_preopen_rows(data):
+def download_one_bhavcopy(date_obj):
 
-    results = []
+    date_str = date_obj.strftime("%d%m%Y")
 
-    raw_rows = data.get(
-        "data",
-        []
+    url = NSE_BHAV_URL.format(date_str)
+
+    try:
+
+        s = nse_session()
+
+        r = s.get(
+            url,
+            timeout=25
+        )
+
+        if r.status_code != 200:
+            return None
+
+        if not r.text.strip():
+            return None
+
+        df = pd.read_csv(
+            StringIO(r.text)
+        )
+
+        df.columns = [
+            str(c).strip().upper()
+            for c in df.columns
+        ]
+
+        symbol_col = find_column(
+            df,
+            ["SYMBOL"]
+        )
+
+        turnover_col = find_column(
+            df,
+            ["TOTTRDVAL"]
+        )
+
+        close_col = find_column(
+            df,
+            ["CLOSE_PRICE", "CLOSE"]
+        )
+
+        volume_col = find_column(
+            df,
+            ["TTL_TRD_QNTY", "TOTTRDQTY"]
+        )
+
+        if symbol_col is None:
+            return None
+
+        if turnover_col is None and (
+            close_col is None or volume_col is None
+        ):
+            return None
+
+        result = {}
+
+        for _, row in df.iterrows():
+
+            symbol = str(
+                row[symbol_col]
+            ).strip().upper()
+
+            if not symbol or symbol == "NAN":
+                continue
+
+            try:
+
+                if turnover_col is not None:
+                    turnover = float(
+                        str(row[turnover_col])
+                        .replace(",", "")
+                    )
+
+                else:
+                    close = float(
+                        str(row[close_col])
+                        .replace(",", "")
+                    )
+
+                    volume = float(
+                        str(row[volume_col])
+                        .replace(",", "")
+                    )
+
+                    turnover = close * volume
+
+                if turnover > 0:
+                    result[symbol] = turnover
+
+            except Exception:
+                continue
+
+        if not result:
+            return None
+
+        return {
+            "date": date_obj.strftime("%Y-%m-%d"),
+            "data": result
+        }
+
+    except Exception:
+        return None
+
+
+def get_last_20_trading_days():
+
+    dates = []
+
+    d = datetime.now().date() - timedelta(days=1)
+
+    while len(dates) < 30:
+
+        if d.weekday() < 5:
+            dates.append(d)
+
+        d -= timedelta(days=1)
+
+    return dates
+
+
+def build_liquidity_cache():
+
+    global liquidity_cache
+    global liquidity_cache_date
+
+    today = datetime.now().date()
+
+    with cache_lock:
+
+        # Same day: use existing cache.
+        if (
+            liquidity_cache_date == today
+            and liquidity_cache
+        ):
+            return liquidity_cache
+
+    dates = get_last_20_trading_days()
+
+    daily_data = []
+
+    # Download historical files in parallel.
+    with ThreadPoolExecutor(
+        max_workers=5
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                download_one_bhavcopy,
+                d
+            ): d
+            for d in dates
+        }
+
+        for future in as_completed(futures):
+
+            try:
+                result = future.result()
+
+                if result is not None:
+                    daily_data.append(result)
+
+            except Exception:
+                pass
+
+    # Keep only successful trading-day files.
+    daily_data = sorted(
+        daily_data,
+        key=lambda x: x["date"],
+        reverse=True
     )
 
-    for item in raw_rows:
+    daily_data = daily_data[:LIQUIDITY_DAYS]
 
-        if not isinstance(item, dict):
-            continue
-
-        metadata = item.get(
-            "metadata",
-            {}
+    if len(daily_data) < LIQUIDITY_DAYS:
+        raise Exception(
+            f"Only {len(daily_data)} valid trading days "
+            f"available. Need {LIQUIDITY_DAYS}."
         )
 
-        detail = item.get(
-            "detail",
-            {}
-        )
+    turnover_sum = {}
+    turnover_count = {}
 
-        preopen = detail.get(
+    for day in daily_data:
+
+        for symbol, turnover in day["data"].items():
+
+            turnover_sum[symbol] = (
+                turnover_sum.get(symbol, 0)
+                + turnover
+            )
+
+            turnover_count[symbol] = (
+                turnover_count.get(symbol, 0)
+                + 1
+            )
+
+    avg_turnover = {}
+
+    for symbol in turnover_sum:
+
+        count = turnover_count[symbol]
+
+        if count == LIQUIDITY_DAYS:
+
+            avg_turnover[symbol] = (
+                turnover_sum[symbol] / count
+            )
+
+    with cache_lock:
+
+        liquidity_cache = avg_turnover
+        liquidity_cache_date = today
+
+    return avg_turnover
+
+
+def parse_preopen(data):
+
+    rows = []
+
+    for item in data:
+
+        meta = item.get("metadata", {})
+        trade = item.get("detail", {}).get(
             "preOpenMarket",
             {}
         )
 
-        if not isinstance(metadata, dict):
-            metadata = {}
-
-        if not isinstance(detail, dict):
-            detail = {}
-
-        if not isinstance(preopen, dict):
-            preopen = {}
-
-        sources = [
-            preopen,
-            detail,
-            metadata,
-            item
-        ]
-
-        symbol = extract_possible_value(
-            sources,
-            [
-                "symbol",
-                "SYMBOL"
-            ]
-        )
-
-        previous_close = extract_possible_value(
-            sources,
-            [
-                "previousClose",
-                "prevClose",
-                "previous_close",
-                "PREVIOUSCLOSE"
-            ]
-        )
-
-        opening_price = extract_possible_value(
-            sources,
-            [
-                "finalPrice",
-                "iep",
-                "IEP",
-                "indicativeEquilibriumPrice",
-                "indicativeEquilibrium",
-                "open",
-                "OPEN"
-            ]
+        symbol = (
+            meta.get("symbol")
+            or item.get("symbol")
         )
 
         if not symbol:
@@ -544,441 +529,165 @@ def extract_preopen_rows(data):
             symbol
         ).strip().upper()
 
-        previous_close = clean_number(
-            previous_close
+        previous_close = (
+            meta.get("previousClose")
+            or meta.get("prevClose")
+            or item.get("previousClose")
         )
 
-        opening_price = clean_number(
-            opening_price
+        opening_price = (
+            meta.get("finalPrice")
+            or meta.get("iep")
+            or meta.get("indicativeEquilibriumPrice")
+            or trade.get("finalPrice")
+            or trade.get("iep")
         )
 
-        if (
-            previous_close <= 0
-            or opening_price <= 0
-        ):
+        try:
+
+            previous_close = float(
+                str(previous_close)
+                .replace(",", "")
+            )
+
+            opening_price = float(
+                str(opening_price)
+                .replace(",", "")
+            )
+
+        except Exception:
+            continue
+
+        if previous_close <= 0:
+            continue
+
+        if opening_price <= 0:
             continue
 
         gap = (
-            (
-                opening_price
-                - previous_close
-            )
+            (opening_price - previous_close)
             / previous_close
-        ) * 100.0
+        ) * 100
 
-        results.append(
-            {
-                "symbol": symbol,
-                "open": opening_price,
-                "previous_close": previous_close,
-                "gap": gap
-            }
-        )
+        rows.append({
+            "symbol": symbol,
+            "open": opening_price,
+            "prev_close": previous_close,
+            "gap": gap
+        })
 
-    return results
+    return rows
 
-
-# ---------------------------------------------------------
-# Main Scanner
-# ---------------------------------------------------------
 
 def run_scanner():
 
-    # Historical liquidity data.
-    average_turnover = (
-        get_previous_20_day_turnover()
-    )
+    # Load 20-day historical liquidity.
+    avg_turnover = build_liquidity_cache()
 
-    # ETF symbols.
-    etf_symbols = get_etf_symbols()
+    # Load today's NSE pre-open only.
+    preopen = get_preopen_data()
 
-    # Current pre-open data.
-    preopen_data = get_preopen_data()
+    parsed = parse_preopen(preopen)
 
-    preopen_rows = extract_preopen_rows(
-        preopen_data
-    )
+    # Load ETF list.
+    etfs = get_etf_symbols()
 
     results = []
 
-    for stock in preopen_rows:
+    for row in parsed:
 
-        symbol = stock["symbol"]
+        symbol = row["symbol"]
 
-        # ---------------------------------------------
-        # ETF EXCLUSION
-        # ---------------------------------------------
-
-        if symbol in etf_symbols:
+        # ETF excluded.
+        if symbol in etfs:
             continue
 
-        # ---------------------------------------------
-        # OPENING PRICE > ₹20
-        # ---------------------------------------------
-
-        if stock["open"] <= MIN_PRICE:
+        # Price > ₹20.
+        if row["open"] <= MIN_PRICE:
             continue
 
-        # ---------------------------------------------
-        # POSITIVE GAP >= 1%
-        # ---------------------------------------------
-
-        if stock["gap"] < MIN_GAP:
+        # Positive gap >= 1%.
+        if row["gap"] < MIN_GAP:
             continue
 
-        # ---------------------------------------------
-        # PREVIOUS 20 COMPLETED DAYS
-        # AVERAGE REAL TURNOVER > ₹10 CRORE
-        # ---------------------------------------------
-
-        avg_turnover = average_turnover.get(
-            symbol,
-            0
-        )
-
-        if avg_turnover <= MIN_AVG_TURNOVER:
+        # Must have 20-day average real turnover.
+        if symbol not in avg_turnover:
             continue
 
-        # ---------------------------------------------
-        # FINAL RESULT
-        # ---------------------------------------------
+        # Average turnover > ₹10 crore.
+        if avg_turnover[symbol] <= MIN_AVG_TURNOVER:
+            continue
 
-        results.append(
-            {
-                "symbol": symbol,
-                "gap": stock["gap"],
-                "open": stock["open"],
-                "previous_close": stock[
-                    "previous_close"
-                ],
-                "avg_turnover": avg_turnover
-            }
-        )
+        results.append({
+            "symbol": symbol,
+            "name": symbol,
+            "gap": row["gap"],
+            "open": row["open"],
+            "prev_close": row["prev_close"],
+            "avg_turnover": avg_turnover[symbol]
+        })
 
-    # Biggest Opening Gap first.
+    # Highest Gap first.
     results.sort(
         key=lambda x: x["gap"],
         reverse=True
     )
 
+    for i, row in enumerate(
+        results,
+        start=1
+    ):
+        row["rank"] = i
+
     return results
 
-
-# ---------------------------------------------------------
-# HTML
-# ---------------------------------------------------------
-
-HTML = """
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
-
-<title>
-Morning Positive Gap Scanner
-</title>
-
-<style>
-
-body {
-    background: #121212;
-    color: #eeeeee;
-    font-family: Arial, sans-serif;
-    margin: 0;
-    padding: 15px;
-}
-
-h1 {
-    font-size: 25px;
-    margin-bottom: 10px;
-}
-
-.info {
-    background: #1e1e1e;
-    border: 1px solid #333333;
-    padding: 13px;
-    border-radius: 8px;
-    margin-bottom: 15px;
-    line-height: 1.65;
-}
-
-.condition {
-    color: #dddddd;
-}
-
-button {
-    background: #00d26a;
-    color: #000000;
-    border: none;
-    padding: 13px 22px;
-    border-radius: 7px;
-    font-size: 16px;
-    font-weight: bold;
-    cursor: pointer;
-    margin-bottom: 15px;
-}
-
-button:active {
-    transform: scale(0.98);
-}
-
-.status {
-    background: #1e1e1e;
-    padding: 10px;
-    border-radius: 7px;
-    margin-bottom: 12px;
-    color: #bbbbbb;
-}
-
-.table-wrap {
-    overflow-x: auto;
-}
-
-table {
-    width: 100%;
-    border-collapse: collapse;
-    background: #1a1a1a;
-}
-
-th {
-    background: #252525;
-    color: #ffffff;
-    padding: 10px;
-    border: 1px solid #383838;
-    white-space: nowrap;
-    position: sticky;
-    top: 0;
-}
-
-td {
-    padding: 10px;
-    border: 1px solid #333333;
-    white-space: nowrap;
-}
-
-.gap {
-    color: #00d26a;
-    font-weight: bold;
-}
-
-.rank {
-    font-weight: bold;
-}
-
-.note {
-    color: #999999;
-    font-size: 13px;
-    margin-top: 12px;
-}
-
-.error {
-    color: #ff7777;
-    font-weight: bold;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<h1>
-Morning Positive Gap Scanner
-</h1>
-
-<div class="info">
-
-<b>Time Frame:</b>
-NSE Pre-Open / 9:08-9:09 AM
-
-<br><br>
-
-<b>Conditions:</b>
-
-<div class="condition">
-1. NSE Equity only<br>
-2. ETF excluded<br>
-3. Opening Price &gt; ₹20<br>
-4. Opening Gap ≥ +1%<br>
-5. Previous 20 completed trading days
-   Average Real Turnover &gt; ₹10 Crore<br>
-6. Highest Opening Gap % first
-</div>
-
-<br>
-
-<b>Important:</b>
-Today's Close is NOT used.
-
-</div>
-
-<form action="/scan" method="get">
-
-<button type="submit">
-Run Scanner
-</button>
-
-</form>
-
-{% if message %}
-
-<div class="status">
-
-{{ message }}
-
-</div>
-
-{% endif %}
-
-{% if results %}
-
-<div class="status">
-
-<b>
-{{ results|length }} stocks found
-</b>
-
-</div>
-
-<div class="table-wrap">
-
-<table>
-
-<tr>
-
-<th>Rank</th>
-
-<th>Stock</th>
-
-<th>Gap %</th>
-
-<th>Opening Price</th>
-
-<th>Previous Close</th>
-
-<th>20D Avg Turnover</th>
-
-</tr>
-
-{% for r in results %}
-
-<tr>
-
-<td class="rank">
-{{ loop.index }}
-</td>
-
-<td>
-<b>{{ r.symbol }}</b>
-</td>
-
-<td class="gap">
-+{{ "%.2f"|format(r.gap) }}%
-</td>
-
-<td>
-₹{{ "%.2f"|format(r.open) }}
-</td>
-
-<td>
-₹{{ "%.2f"|format(r.previous_close) }}
-</td>
-
-<td>
-₹{{ "{:,.0f}".format(r.avg_turnover) }}
-</td>
-
-</tr>
-
-{% endfor %}
-
-</table>
-
-</div>
-
-<div class="note">
-
-20D Avg Turnover = previous 20 completed
-trading days का average actual traded value.
-
-</div>
-
-{% endif %}
-
-</body>
-
-</html>
-"""
-
-
-# ---------------------------------------------------------
-# Home Page
-# ---------------------------------------------------------
 
 @app.route("/")
 def home():
 
     return render_template_string(
         HTML,
-        results=[],
-        message=(
-            "Scanner ready. "
-            "9:08-9:09 AM पर Run Scanner दबाएँ।"
-        )
+        rows=None,
+        status=None
     )
 
-
-# ---------------------------------------------------------
-# Scan
-# ---------------------------------------------------------
 
 @app.route("/scan")
 def scan():
 
+    start = time.time()
+
     try:
 
-        results = run_scanner()
+        rows = run_scanner()
+
+        elapsed = time.time() - start
+
+        status = (
+            f"Scan complete. "
+            f"{len(rows)} stocks found. "
+            f"Time: {elapsed:.1f} seconds."
+        )
 
         return render_template_string(
             HTML,
-            results=results,
-            message=(
-                "Scan complete. "
-                + str(len(results))
-                + " stocks found."
-            )
+            rows=rows,
+            status=status
         )
 
     except Exception as e:
 
         return render_template_string(
             HTML,
-            results=[],
-            message=(
-                "Scanner error: "
-                + str(e)
-            )
+            rows=None,
+            status=f"Scanner error: {e}"
         )
 
-
-# ---------------------------------------------------------
-# Render / Local Server
-# ---------------------------------------------------------
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=5000,
+        debug=False
     )
