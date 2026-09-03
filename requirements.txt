@@ -1,4 +1,4 @@
-# Time frame: Daily / Today's Opening Gap
+# Time frame: Daily / Opening Gap + 20-Day Liquidity
 flask
 requests
 gunicorn
