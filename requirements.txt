@@ -1,6 +1,5 @@
-# Time frame: Daily / Pre-Open
-
+# Time frame: Daily Historical Liquidity + NSE Pre-Open
 flask
 requests
-gunicorn
 pandas
+gunicorn
