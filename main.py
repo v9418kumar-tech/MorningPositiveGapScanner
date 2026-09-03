@@ -1,173 +1,299 @@
-# Time frame: Daily
-# Morning Positive Gap Scanner
-# NSE Pre-Open + Daily Liquidity Filter
+# Time frame: Daily / NSE Pre-Open
 
 from flask import Flask, render_template_string
 import requests
+import os
 from datetime import datetime
 
 app = Flask(__name__)
 
-NSE_URL = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
+NSE_HOME = "https://www.nseindia.com/"
+NSE_API = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/"
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive"
 }
+
+
+def get_gap_data():
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    try:
+        # First visit NSE homepage to obtain cookies
+        home = session.get(NSE_HOME, timeout=15)
+
+        # Then request pre-open data
+        response = session.get(NSE_API, timeout=20)
+
+        if response.status_code != 200:
+            return [], f"NSE returned HTTP {response.status_code}"
+
+        data = response.json()
+
+        if "data" not in data:
+            return [], "NSE response does not contain data"
+
+        results = []
+
+        for item in data["data"]:
+            meta = item.get("metadata", {})
+            price = item.get("detail", {}).get("preOpenMarket", {})
+
+            symbol = meta.get("symbol", "")
+            series = meta.get("series", "")
+
+            previous_close = price.get("prevClose")
+            open_price = price.get("iep")
+
+            # NSE Equity only
+            if series != "EQ":
+                continue
+
+            if not symbol or not previous_close or not open_price:
+                continue
+
+            try:
+                previous_close = float(previous_close)
+                open_price = float(open_price)
+            except:
+                continue
+
+            # Price > Rs 20
+            if open_price <= 20:
+                continue
+
+            # Positive gap-up >= 1%
+            gap = ((open_price - previous_close) / previous_close) * 100
+
+            if gap < 1:
+                continue
+
+            results.append({
+                "symbol": symbol,
+                "gap": gap,
+                "open": open_price,
+                "previous_close": previous_close
+            })
+
+        # Highest Gap % first
+        results.sort(key=lambda x: x["gap"], reverse=True)
+
+        return results, None
+
+    except requests.exceptions.RequestException as e:
+        return [], f"NSE connection error: {str(e)}"
+
+    except Exception as e:
+        return [], f"Scanner error: {str(e)}"
+
 
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>Morning Positive Gap Scanner</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body { font-family: Arial; margin: 15px; background:#111; color:white; }
-h2 { color:#00e5ff; }
-button { padding:12px 18px; margin-bottom:15px; }
-table { width:100%; border-collapse:collapse; }
-th,td { padding:9px; border-bottom:1px solid #444; text-align:right; }
-th { cursor:pointer; color:#00e5ff; }
-td:first-child,td:nth-child(2) { text-align:left; }
-.gap { color:#00ff88; font-weight:bold; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Morning Positive Gap</title>
+
+    <style>
+        body {
+            background: #111;
+            color: white;
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        h1 {
+            color: #00d9ff;
+            font-size: 30px;
+        }
+
+        .timeframe {
+            font-size: 18px;
+            margin-bottom: 20px;
+        }
+
+        button {
+            padding: 12px 20px;
+            font-size: 17px;
+            cursor: pointer;
+            margin-bottom: 20px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            color: #00d9ff;
+            font-size: 18px;
+            padding: 12px 8px;
+            border-bottom: 1px solid #555;
+            cursor: pointer;
+        }
+
+        td {
+            padding: 12px 8px;
+            border-bottom: 1px solid #333;
+            font-size: 16px;
+        }
+
+        .gap {
+            color: #00ff66;
+            font-weight: bold;
+        }
+
+        .error {
+            color: #ff5555;
+            font-size: 17px;
+            margin-top: 20px;
+        }
+
+        .info {
+            color: #aaa;
+            margin-top: 15px;
+        }
+    </style>
 </head>
 
 <body>
 
-<h2>🚀 MORNING POSITIVE GAP</h2>
+<h1>🚀 MORNING POSITIVE GAP</h1>
 
-<p>Time frame: Daily / NSE Pre-Open</p>
+<div class="timeframe">
+    Time frame: Daily / NSE Pre-Open
+</div>
 
-<button onclick="location.reload()">🔄 Refresh Scanner</button>
+<form method="get">
+    <button type="submit">🔄 Refresh Scanner</button>
+</form>
 
-<table id="stocks">
-<thead>
-<tr>
-<th>Stock</th>
-<th>Symbol</th>
-<th onclick="sortTable(2)">Gap % ↕</th>
-<th>Open</th>
-<th>Prev Close</th>
-</tr>
-</thead>
+{% if error %}
+    <div class="error">
+        ⚠️ {{ error }}
+    </div>
+{% endif %}
 
-<tbody>
-{% for s in stocks %}
-<tr>
-<td>{{ s.symbol }}</td>
-<td>{{ s.symbol }}</td>
-<td class="gap">{{ "%.2f"|format(s.gap) }}%</td>
-<td>{{ s.open }}</td>
-<td>{{ s.prev_close }}</td>
-</tr>
-{% endfor %}
-</tbody>
+{% if stocks %}
+
+<table id="gapTable">
+
+    <thead>
+        <tr>
+            <th>Stock</th>
+            <th>Symbol</th>
+            <th onclick="sortTable(2)">
+                Gap % ↕
+            </th>
+            <th>Open</th>
+            <th>Prev Close</th>
+        </tr>
+    </thead>
+
+    <tbody>
+
+    {% for stock in stocks %}
+
+        <tr>
+            <td>{{ stock.symbol }}</td>
+
+            <td>{{ stock.symbol }}</td>
+
+            <td class="gap">
+                {{ "%.2f"|format(stock.gap) }}%
+            </td>
+
+            <td>
+                ₹{{ "%.2f"|format(stock.open) }}
+            </td>
+
+            <td>
+                ₹{{ "%.2f"|format(stock.previous_close) }}
+            </td>
+        </tr>
+
+    {% endfor %}
+
+    </tbody>
+
 </table>
 
-<script>
-function sortTable(n) {
-    let table = document.getElementById("stocks");
-    let rows = Array.from(table.rows).slice(1);
+<div class="info">
+    Total stocks found: {{ stocks|length }}
+</div>
 
-    rows.sort(function(a,b) {
-        return parseFloat(b.cells[n].innerText) -
-               parseFloat(a.cells[n].innerText);
+{% else %}
+
+    {% if not error %}
+        <div class="info">
+            अभी कोई qualifying stock नहीं मिला।
+        </div>
+    {% endif %}
+
+{% endif %}
+
+
+<script>
+
+function sortTable(column) {
+
+    let table = document.getElementById("gapTable");
+
+    let rows = Array.from(
+        table.rows
+    ).slice(1);
+
+    rows.sort(function(a, b) {
+
+        let A = parseFloat(
+            a.cells[column].innerText.replace("%", "")
+        );
+
+        let B = parseFloat(
+            b.cells[column].innerText.replace("%", "")
+        );
+
+        return B - A;
     });
 
-    rows.forEach(row => table.tBodies[0].appendChild(row));
+    let tbody = table.tBodies[0];
+
+    rows.forEach(function(row) {
+        tbody.appendChild(row);
+    });
 }
+
 </script>
 
 </body>
 </html>
 """
 
-def get_preopen_data():
-
-    session = requests.Session()
-
-    try:
-        session.get(
-            "https://www.nseindia.com/",
-            headers=HEADERS,
-            timeout=10
-        )
-
-        response = session.get(
-            NSE_URL,
-            headers=HEADERS,
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except Exception as e:
-        print("NSE ERROR:", e)
-        return {"data": []}
-
 
 @app.route("/")
-def scanner():
+def home():
 
-    data = get_preopen_data()
-
-    stocks = []
-
-    for item in data.get("data", []):
-
-        meta = item.get("metadata", {})
-        price = item.get("priceInfo", {})
-
-        symbol = meta.get("symbol")
-        series = meta.get("series")
-
-        open_price = price.get("open")
-        prev_close = price.get("previousClose")
-
-        if not symbol or not open_price or not prev_close:
-            continue
-
-        # NSE Equity only
-        if series != "EQ":
-            continue
-
-        # Price filter
-        if open_price <= 20:
-            continue
-
-        # Positive Gap %
-        gap = ((open_price - prev_close) / prev_close) * 100
-
-        # Minimum 1% gap-up
-        if gap < 1:
-            continue
-
-        stocks.append({
-            "symbol": symbol,
-            "open": open_price,
-            "prev_close": prev_close,
-            "gap": gap
-        })
-
-    # Largest Gap first
-    stocks.sort(key=lambda x: x["gap"], reverse=True)
+    stocks, error = get_gap_data()
 
     return render_template_string(
         HTML,
-        stocks=stocks
+        stocks=stocks,
+        error=error
     )
 
 
-# Time frame: Daily / NSE Pre-Open
-
 if __name__ == "__main__":
-    import os
+
+    port = int(os.environ.get("PORT", 10000))
+
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
+        port=port
     )
