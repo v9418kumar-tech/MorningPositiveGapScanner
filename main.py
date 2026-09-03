@@ -19,7 +19,6 @@ HOME = "https://www.nseindia.com/"
 BHAV_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{}.csv"
 ETF_URL = "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv"
 
-# Result cache
 CACHE = None
 CACHE_TIME = None
 
@@ -47,7 +46,6 @@ def get_csv(s, url):
             return []
 
         reader = csv.DictReader(io.StringIO(r.text))
-
         data = []
 
         for row in reader:
@@ -115,7 +113,6 @@ def run_scan():
     global CACHE
     global CACHE_TIME
 
-    # Use cached result for 5 minutes
     if CACHE is not None and CACHE_TIME is not None:
 
         if (
@@ -127,11 +124,6 @@ def run_scan():
     s = session_start()
 
     today = datetime.now()
-
-    # ------------------------------------------------
-    # STEP 1
-    # Get latest trading-day data
-    # ------------------------------------------------
 
     current = []
     trading_date = today
@@ -151,19 +143,11 @@ def run_scan():
     if not current:
         return []
 
-    # ------------------------------------------------
-    # STEP 2
-    # Remove ETFs
-    # ------------------------------------------------
-
     etfs = get_etfs(s)
 
     candidates = []
 
-    # ------------------------------------------------
-    # STEP 3
     # Chartink conditions 1 + 2
-    # ------------------------------------------------
 
     for r in current:
 
@@ -229,11 +213,6 @@ def run_scan():
     if not candidates:
         return []
 
-    # ------------------------------------------------
-    # STEP 4
-    # Sort gap first
-    # ------------------------------------------------
-
     candidates.sort(
         key=lambda x: x["gap"],
         reverse=True
@@ -243,13 +222,6 @@ def run_scan():
         x["symbol"]
         for x in candidates
     }
-
-    # ------------------------------------------------
-    # STEP 5
-    # 20 trading-day volume
-    #
-    # Only gap candidates are checked.
-    # ------------------------------------------------
 
     history = {
         x: []
@@ -297,13 +269,7 @@ def run_scan():
 
             break
 
-    # ------------------------------------------------
-    # STEP 6
     # EXACT Chartink liquidity condition
-    #
-    # Daily Close × SMA(Daily Volume,20)
-    # > ₹100,000,000
-    # ------------------------------------------------
 
     results = []
 
@@ -334,7 +300,6 @@ def run_scan():
             "turnover": turnover
         })
 
-    # Highest gap first
     results.sort(
         key=lambda x: x["gap"],
         reverse=True
@@ -360,58 +325,92 @@ content="width=device-width, initial-scale=1">
 
 <style>
 
+/* Chartink-style dark theme */
+
 body {
-    font-family: Arial;
-    background: #f5f5f5;
+    font-family: Arial, sans-serif;
+    background: #121212;
+    color: #e6e6e6;
     padding: 12px;
+    margin: 0;
 }
 
 h1 {
     font-size: 24px;
+    color: #ffffff;
+    margin-bottom: 15px;
 }
 
 .info {
-    background: white;
+    background: #1e1e1e;
+    color: #d8d8d8;
     padding: 15px;
     border-radius: 10px;
     margin-bottom: 12px;
+    border: 1px solid #333333;
+    line-height: 1.6;
+}
+
+.info b {
+    color: #ffffff;
 }
 
 button {
     padding: 13px 20px;
     font-size: 17px;
-    border: 0;
+    border: 1px solid #444444;
     border-radius: 8px;
+    background: #252525;
+    color: #ffffff;
+    cursor: pointer;
+}
+
+button:active {
+    background: #333333;
 }
 
 #status {
     margin: 15px 0;
     font-weight: bold;
+    color: #bdbdbd;
 }
 
 .box {
     overflow-x: auto;
+    border-radius: 8px;
 }
 
 table {
     width: 100%;
-    background: white;
+    background: #1a1a1a;
     border-collapse: collapse;
+    color: #dddddd;
 }
 
 th, td {
-    border: 1px solid #ddd;
+    border: 1px solid #333333;
     padding: 8px;
     text-align: center;
     white-space: nowrap;
 }
 
 th {
-    background: #eeeeee;
+    background: #252525;
+    color: #ffffff;
+    font-weight: bold;
+}
+
+tr:nth-child(even) {
+    background: #1d1d1d;
+}
+
+tr:hover {
+    background: #292929;
 }
 
 .gap {
     font-weight: bold;
+    color: #00d26a;
 }
 
 </style>
@@ -437,13 +436,13 @@ Previous Close × 100
 <b>Conditions:</b>
 
 <br>
-Price > ₹20
+Price &gt; ₹20
 
 <br>
 Positive Gap ≥ 1%
 
 <br>
-Close × 20-Day Average Volume > ₹10 Crore
+Close × 20-Day Average Volume &gt; ₹10 Crore
 
 <br>
 ETF excluded
