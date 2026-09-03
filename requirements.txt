@@ -1,4 +1,4 @@
-# Time frame: Daily / Opening Gap + 20-Day Liquidity
+# Time frame: NSE Pre-Open 9:08-9:09 AM + Previous 20 Trading Days
 flask
 requests
 gunicorn
