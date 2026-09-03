@@ -163,8 +163,11 @@ def scanner():
     )
 
 
+# Time frame: Daily / NSE Pre-Open
+
 if __name__ == "__main__":
+    import os
     app.run(
         host="0.0.0.0",
-        port=10000
+        port=int(os.environ.get("PORT", 10000))
     )
