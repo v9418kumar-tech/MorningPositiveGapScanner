@@ -1,0 +1,3 @@
+Time frame: Daily / Pre-Open
+flask
+requests
