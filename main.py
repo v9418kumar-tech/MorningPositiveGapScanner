@@ -1,212 +1,326 @@
-# Time frame: Daily / Full Day Opening Gap + 20-Day Liquidity
+# Time frame: Daily / Opening Gap + 20-Day Liquidity
 
 from flask import Flask, render_template_string
 import requests
-import pandas as pd
+import csv
+import io
+import os
 from datetime import datetime, timedelta
-from io import StringIO
 
 app = Flask(__name__)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "text/csv,application/json,text/plain,*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "*/*",
     "Referer": "https://www.nseindia.com/"
 }
 
-NSE_HOME = "https://www.nseindia.com/"
+HOME = "https://www.nseindia.com/"
 BHAV_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{}.csv"
 ETF_URL = "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv"
 
 
 def get_session():
-    s = requests.Session()
-    s.headers.update(HEADERS)
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
     try:
-        s.get(NSE_HOME, timeout=10)
-    except:
+        session.get(HOME, timeout=10)
+    except Exception:
         pass
-    return s
+
+    return session
 
 
-def get_bhavcopy(session, date):
-    date_text = date.strftime("%d%m%Y")
-    url = BHAV_URL.format(date_text)
-
+def get_csv(session, url):
     try:
         r = session.get(url, timeout=15)
 
         if r.status_code != 200:
-            return None
+            return []
 
-        if len(r.text) < 1000:
-            return None
+        text = r.text.strip()
 
-        df = pd.read_csv(StringIO(r.text))
-        df.columns = [str(c).strip().upper() for c in df.columns]
+        if len(text) < 100:
+            return []
 
-        return df
+        reader = csv.DictReader(io.StringIO(text))
 
-    except:
-        return None
+        rows = []
+
+        for row in reader:
+            clean = {}
+
+            for key, value in row.items():
+                if key:
+                    clean[key.strip().upper()] = (
+                        value.strip() if value else ""
+                    )
+
+            rows.append(clean)
+
+        return rows
+
+    except Exception:
+        return []
 
 
-def main_scan():
+def number(value):
+    try:
+        return float(
+            str(value)
+            .replace(",", "")
+            .strip()
+        )
+    except Exception:
+        return 0.0
+
+
+def get_bhavcopy(session, date):
+
+    date_text = date.strftime("%d%m%Y")
+
+    url = BHAV_URL.format(date_text)
+
+    rows = get_csv(session, url)
+
+    if not rows:
+        return []
+
+    # Only NSE Equity
+    rows = [
+        r for r in rows
+        if r.get("SERIES", "").upper() == "EQ"
+    ]
+
+    return rows
+
+
+def get_etf_symbols(session):
+
+    rows = get_csv(session, ETF_URL)
+
+    symbols = set()
+
+    for row in rows:
+
+        symbol = (
+            row.get("SYMBOL")
+            or row.get("SCRIP CODE")
+            or ""
+        )
+
+        symbol = symbol.strip().upper()
+
+        if symbol:
+            symbols.add(symbol)
+
+    return symbols
+
+
+def scan():
+
     session = get_session()
 
     today = datetime.now()
 
-    # Current / latest available Bhavcopy
-    current = None
+    # --------------------------------------------------
+    # 1. Get latest available trading-day Bhavcopy
+    # --------------------------------------------------
 
-    for i in range(7):
-        d = today - timedelta(days=i)
-        current = get_bhavcopy(session, d)
+    current = []
 
-        if current is not None and len(current) > 50:
+    current_date = today
+
+    for _ in range(7):
+
+        current = get_bhavcopy(
+            session,
+            current_date
+        )
+
+        if len(current) > 50:
             break
 
-    if current is None:
+        current_date -= timedelta(days=1)
+
+    if not current:
         return []
 
-    # Clean column names
-    current.columns = [str(c).strip().upper() for c in current.columns]
+    # --------------------------------------------------
+    # 2. ETF list
+    # --------------------------------------------------
 
-    # Only NSE Equity
-    if "SERIES" in current.columns:
-        current = current[current["SERIES"].astype(str).str.strip() == "EQ"]
+    etf_symbols = get_etf_symbols(session)
 
-    # Numeric conversion
-    for col in ["OPEN_PRICE", "PREV_CLOSE", "CLOSE_PRICE", "TTL_TRD_QNTY"]:
-        if col in current.columns:
-            current[col] = pd.to_numeric(
-                current[col], errors="coerce"
-            )
+    # --------------------------------------------------
+    # 3. First two Chartink conditions
+    #
+    # Close > 20
+    # Open > Previous Close × 1.01
+    # --------------------------------------------------
 
-    current = current.dropna(
-        subset=["OPEN_PRICE", "PREV_CLOSE"]
-    )
+    candidates = []
 
-    # Positive opening gap
-    current["GAP"] = (
-        (current["OPEN_PRICE"] - current["PREV_CLOSE"])
-        / current["PREV_CLOSE"]
-    ) * 100
+    for row in current:
 
-    current = current[
-        (current["OPEN_PRICE"] > 20) &
-        (current["GAP"] >= 1)
-    ].copy()
+        symbol = row.get("SYMBOL", "").strip().upper()
 
-    # ---------------------------------------------------------
-    # 20-Day Average Volume
-    # ---------------------------------------------------------
+        if not symbol:
+            continue
 
-    symbols = set(
-        current["SYMBOL"].astype(str).str.strip()
-    )
+        # Remove ETFs
+        if symbol in etf_symbols:
+            continue
 
-    volume_history = {}
+        open_price = number(
+            row.get("OPEN_PRICE")
+        )
 
-    # Search previous trading days
-    found_days = 0
+        previous_close = number(
+            row.get("PREV_CLOSE")
+        )
 
-    for days_back in range(1, 35):
+        close_price = number(
+            row.get("CLOSE_PRICE")
+        )
 
-        if found_days >= 20:
+        if open_price <= 20:
+            continue
+
+        if previous_close <= 0:
+            continue
+
+        if close_price <= 20:
+            continue
+
+        gap = (
+            (open_price - previous_close)
+            / previous_close
+        ) * 100
+
+        if gap < 1:
+            continue
+
+        candidates.append({
+            "symbol": symbol,
+            "name": (
+                row.get("SECURITY")
+                or row.get("SECURITY_NAME")
+                or symbol
+            ).strip(),
+            "open": open_price,
+            "previous_close": previous_close,
+            "close": close_price,
+            "gap": gap
+        })
+
+    if not candidates:
+        return []
+
+    # --------------------------------------------------
+    # 4. Collect 20 trading days of volume
+    #
+    # Only candidates are checked.
+    # This keeps the scanner lighter.
+    # --------------------------------------------------
+
+    candidate_symbols = {
+        x["symbol"] for x in candidates
+    }
+
+    volume_history = {
+        symbol: []
+        for symbol in candidate_symbols
+    }
+
+    days_found = 0
+    check_date = current_date
+
+    while days_found < 20:
+
+        rows = get_bhavcopy(
+            session,
+            check_date
+        )
+
+        if rows:
+
+            for row in rows:
+
+                symbol = row.get(
+                    "SYMBOL", ""
+                ).strip().upper()
+
+                if symbol not in candidate_symbols:
+                    continue
+
+                volume = number(
+                    row.get("TTL_TRD_QNTY")
+                )
+
+                if volume > 0:
+
+                    volume_history[
+                        symbol
+                    ].append(volume)
+
+            days_found += 1
+
+        check_date -= timedelta(days=1)
+
+        # Safety limit
+        if (current_date - check_date).days > 45:
             break
 
-        d = today - timedelta(days=days_back)
-
-        df = get_bhavcopy(session, d)
-
-        if df is None:
-            continue
-
-        df.columns = [
-            str(c).strip().upper()
-            for c in df.columns
-        ]
-
-        if "SERIES" not in df.columns:
-            continue
-
-        df = df[
-            df["SERIES"].astype(str).str.strip() == "EQ"
-        ]
-
-        if "SYMBOL" not in df.columns:
-            continue
-
-        if "TTL_TRD_QNTY" not in df.columns:
-            continue
-
-        df["SYMBOL"] = (
-            df["SYMBOL"].astype(str).str.strip()
-        )
-
-        df = df[df["SYMBOL"].isin(symbols)].copy()
-
-        df["TTL_TRD_QNTY"] = pd.to_numeric(
-            df["TTL_TRD_QNTY"],
-            errors="coerce"
-        )
-
-        for _, row in df.iterrows():
-
-            symbol = row["SYMBOL"]
-            volume = row["TTL_TRD_QNTY"]
-
-            if pd.isna(volume):
-                continue
-
-            if symbol not in volume_history:
-                volume_history[symbol] = []
-
-            volume_history[symbol].append(float(volume))
-
-        found_days += 1
-
-    # ---------------------------------------------------------
-    # Third Condition:
-    # Price × 20-Day Average Volume > ₹10 Crore
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # 5. EXACT Chartink-style liquidity condition
+    #
+    # Current Close × SMA(Volume,20)
+    # > ₹100,000,000
+    #
+    # ₹10 Crore = ₹100,000,000
+    # --------------------------------------------------
 
     results = []
 
-    for _, row in current.iterrows():
+    for stock in candidates:
 
-        symbol = str(row["SYMBOL"]).strip()
+        symbol = stock["symbol"]
 
-        volumes = volume_history.get(symbol, [])
+        volumes = volume_history.get(
+            symbol,
+            []
+        )
 
-        if len(volumes) < 10:
+        if len(volumes) < 20:
             continue
 
-        avg_volume = sum(volumes) / len(volumes)
+        # 20-day SMA Volume
+        avg_volume = sum(volumes[:20]) / 20
 
-        open_price = float(row["OPEN_PRICE"])
+        # Chartink condition
+        turnover = (
+            stock["close"] * avg_volume
+        )
 
-        liquidity_value = open_price * avg_volume
-
-        # ₹10 Crore = ₹100,000,000
-        if liquidity_value <= 100000000:
+        if turnover <= 100000000:
             continue
 
         results.append({
-            "Stock Name": str(
-                row.get("SECURITY", symbol)
-            ).strip(),
-            "Symbol": symbol,
-            "Gap %": float(row["GAP"]),
-            "Open": open_price,
-            "Previous Close": float(row["PREV_CLOSE"]),
-            "20D Avg Volume": avg_volume,
-            "Avg Turnover": liquidity_value
+            "name": stock["name"],
+            "symbol": symbol,
+            "gap": stock["gap"],
+            "open": stock["open"],
+            "previous_close": stock["previous_close"],
+            "close": stock["close"],
+            "avg_volume": avg_volume,
+            "turnover": turnover
         })
 
+    # Highest Gap first
     results.sort(
-        key=lambda x: x["Gap %"],
+        key=lambda x: x["gap"],
         reverse=True
     )
 
@@ -215,8 +329,11 @@ def main_scan():
 
 HTML = """
 <!DOCTYPE html>
+
 <html>
+
 <head>
+
 <meta name="viewport"
       content="width=device-width, initial-scale=1">
 
@@ -245,8 +362,12 @@ h1 {
 button {
     padding: 12px 18px;
     font-size: 16px;
-    border: 0;
+    border: none;
     border-radius: 8px;
+}
+
+.tablebox {
+    overflow-x: auto;
 }
 
 table {
@@ -260,6 +381,7 @@ th, td {
     border: 1px solid #ddd;
     padding: 8px;
     text-align: center;
+    white-space: nowrap;
 }
 
 th {
@@ -271,6 +393,7 @@ th {
 }
 
 </style>
+
 </head>
 
 <body>
@@ -279,47 +402,70 @@ th {
 
 <div class="info">
 
-<b>Today's Opening Gap</b><br>
+<b>Today's Opening Gap</b>
+
+<br><br>
 
 Gap % =
 (Open - Previous Close) / Previous Close × 100
 
 <br><br>
 
-<b>Filters:</b><br>
+<b>Filters:</b>
 
-Price > ₹20<br>
-Positive Gap ≥ 1%<br>
-20-Day Average Turnover > ₹10 Crore
+<br>
+
+Price > ₹20
+
+<br>
+
+Positive Gap ≥ 1%
+
+<br>
+
+Close × 20-Day Average Volume > ₹10 Crore
+
+<br>
+
+ETF excluded
 
 </div>
 
 <form>
+
 <button type="submit">
 Refresh Scanner
 </button>
+
 </form>
 
 <br>
 
 <div class="info">
+
 <b>
 Today's Open vs Previous Close.
 Sorted by highest Positive Gap.
 </b>
+
 </div>
+
+<div class="tablebox">
 
 <table>
 
 <tr>
+
 <th>Sr.</th>
 <th>Stock Name</th>
 <th>Symbol</th>
 <th>Gap %</th>
 <th>Open</th>
 <th>Previous Close</th>
+<th>Close</th>
 <th>20D Avg Volume</th>
 <th>Avg Turnover</th>
+
 </tr>
 
 {% for r in results %}
@@ -328,28 +474,32 @@ Sorted by highest Positive Gap.
 
 <td>{{ loop.index }}</td>
 
-<td>{{ r["Stock Name"] }}</td>
+<td>{{ r["name"] }}</td>
 
-<td>{{ r["Symbol"] }}</td>
+<td>{{ r["symbol"] }}</td>
 
 <td class="gap">
-+{{ "%.2f"|format(r["Gap %"]) }}%
++{{ "%.2f"|format(r["gap"]) }}%
 </td>
 
 <td>
-₹{{ "%.2f"|format(r["Open"]) }}
+₹{{ "%.2f"|format(r["open"]) }}
 </td>
 
 <td>
-₹{{ "%.2f"|format(r["Previous Close"]) }}
+₹{{ "%.2f"|format(r["previous_close"]) }}
 </td>
 
 <td>
-{{ "{:,.0f}".format(r["20D Avg Volume"]) }}
+₹{{ "%.2f"|format(r["close"]) }}
 </td>
 
 <td>
-₹{{ "{:,.0f}".format(r["Avg Turnover"]) }}
+{{ "{:,.0f}".format(r["avg_volume"]) }}
+</td>
+
+<td>
+₹{{ "{:,.0f}".format(r["turnover"]) }}
 </td>
 
 </tr>
@@ -358,7 +508,10 @@ Sorted by highest Positive Gap.
 
 </table>
 
+</div>
+
 </body>
+
 </html>
 """
 
@@ -366,7 +519,7 @@ Sorted by highest Positive Gap.
 @app.route("/")
 def home():
 
-    results = main_scan()
+    results = scan()
 
     return render_template_string(
         HTML,
@@ -375,8 +528,6 @@ def home():
 
 
 if __name__ == "__main__":
-
-    import os
 
     port = int(
         os.environ.get("PORT", 10000)
