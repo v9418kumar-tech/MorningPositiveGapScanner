@@ -1,26 +1,10 @@
-# Time frame: Daily / NSE Pre-Open + Full Day Gap Scanner
+# Time frame: Daily / Full Day Opening Gap Scanner
 
 from flask import Flask, render_template_string
-import requests
+import yfinance as yf
 import os
-from datetime import datetime, time
 
 app = Flask(__name__)
-
-NSE_HOME = "https://www.nseindia.com/"
-PREOPEN_URL = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/139.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
-    "Connection": "keep-alive",
-}
 
 HTML = """
 <!DOCTYPE html>
@@ -28,6 +12,7 @@ HTML = """
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Morning Positive Gap Scanner</title>
+
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -82,7 +67,6 @@ HTML = """
 
         th {
             background: #eeeeee;
-            cursor: pointer;
         }
 
         tr:nth-child(even) {
@@ -100,7 +84,7 @@ HTML = """
 <h1>🚀 MORNING POSITIVE GAP</h1>
 
 <div class="info">
-    <b>Time frame:</b> Daily / NSE Pre-Open + Full Day
+    <b>Time frame:</b> Daily / Full Day Opening Gap
 </div>
 
 <form>
@@ -121,7 +105,7 @@ HTML = """
 {% endif %}
 
 {% if stocks %}
-<table id="gapTable">
+<table>
     <thead>
         <tr>
             <th>Sr.</th>
@@ -139,125 +123,72 @@ HTML = """
             <td>{{ loop.index }}</td>
             <td>{{ stock.name }}</td>
             <td>{{ stock.symbol }}</td>
-            <td class="gap">{{ "%.2f"|format(stock.gap) }}%</td>
-            <td>{{ stock.open }}</td>
-            <td>{{ stock.prev_close }}</td>
+            <td class="gap">
+                {{ "%.2f"|format(stock.gap) }}%
+            </td>
+            <td>{{ "%.2f"|format(stock.open) }}</td>
+            <td>{{ "%.2f"|format(stock.prev_close) }}</td>
         </tr>
     {% endfor %}
     </tbody>
 </table>
 {% endif %}
 
-<script>
-function sortGapDescending() {
-    const table = document.getElementById("gapTable");
-    if (!table) return;
-
-    const tbody = table.querySelector("tbody");
-    const rows = Array.from(tbody.querySelectorAll("tr"));
-
-    rows.sort(function(a, b) {
-        const gapA = parseFloat(
-            a.cells[3].innerText.replace("%", "")
-        );
-        const gapB = parseFloat(
-            b.cells[3].innerText.replace("%", "")
-        );
-
-        return gapB - gapA;
-    });
-
-    rows.forEach(function(row) {
-        tbody.appendChild(row);
-    });
-
-    rows.forEach(function(row, index) {
-        row.cells[0].innerText = index + 1;
-    });
-}
-
-sortGapDescending();
-</script>
-
 </body>
 </html>
 """
 
 
-def get_nse_preopen():
+def get_indian_equities():
     """
-    Time frame: Daily / NSE Pre-Open
-
-    NSE Pre-Open data fetch.
+    Time frame: Daily / India Equity
+    Yahoo Finance India equity screener.
     """
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    query = yf.EquityQuery(
+        "and",
+        [
+            yf.EquityQuery("eq", ["region", "in"]),
+            yf.EquityQuery("eq", ["exchange", "NSI"]),
+            yf.EquityQuery("gt", ["intradayprice", 20])
+        ]
+    )
 
-    try:
-        home = session.get(
-            NSE_HOME,
-            timeout=15
-        )
+    result = yf.screen(
+        query,
+        offset=0,
+        size=250,
+        sortField="dayvolume",
+        sortAsc=False
+    )
 
-        if home.status_code != 200:
-            return None, f"NSE homepage HTTP status: {home.status_code}"
-
-        response = session.get(
-            PREOPEN_URL,
-            timeout=20
-        )
-
-        if response.status_code != 200:
-            return None, (
-                f"NSE Pre-Open HTTP status: "
-                f"{response.status_code}"
-            )
-
-        try:
-            data = response.json()
-        except Exception:
-            return None, (
-                "NSE ने JSON data नहीं भेजा। "
-                f"Response शुरू होता है: {response.text[:200]}"
-            )
-
-        return data, None
-
-    except requests.exceptions.RequestException as e:
-        return None, f"NSE connection error: {str(e)}"
+    return result.get("quotes", [])
 
 
-def parse_preopen(data):
+def build_scanner():
     """
-    Time frame: Daily / NSE Pre-Open
+    Time frame: Daily / Full Day Opening Gap
     """
+
+    quotes = get_indian_equities()
 
     stocks = []
 
-    if not data:
-        return stocks
+    for q in quotes:
 
-    records = data.get("data", [])
-
-    if not isinstance(records, list):
-        return stocks
-
-    for item in records:
-
-        metadata = item.get("metadata", {})
-        price = item.get("priceInfo", {})
-
-        symbol = metadata.get("symbol", "")
-        series = metadata.get("series", "")
-
-        open_price = price.get("open")
-        prev_close = price.get("previousClose")
+        symbol = q.get("symbol")
 
         if not symbol:
             continue
 
-        if series != "EQ":
+        # Equity only
+        if q.get("quoteType", "").upper() != "EQUITY":
+            continue
+
+        open_price = q.get("regularMarketOpen")
+        prev_close = q.get("regularMarketPreviousClose")
+
+        if open_price is None or prev_close is None:
             continue
 
         try:
@@ -272,19 +203,28 @@ def parse_preopen(data):
         if prev_close <= 0:
             continue
 
-        gap = ((open_price - prev_close) / prev_close) * 100
+        gap = (
+            (open_price - prev_close)
+            / prev_close
+        ) * 100
 
+        # Positive gap only
         if gap < 1:
             continue
 
         stocks.append({
-            "name": metadata.get("companyName", symbol),
-            "symbol": symbol,
+            "name": (
+                q.get("longName")
+                or q.get("shortName")
+                or symbol
+            ),
+            "symbol": symbol.replace(".NS", ""),
             "gap": gap,
             "open": open_price,
             "prev_close": prev_close
         })
 
+    # Gap % descending
     stocks.sort(
         key=lambda x: x["gap"],
         reverse=True
@@ -296,44 +236,48 @@ def parse_preopen(data):
 @app.route("/")
 def scanner():
 
-    now = datetime.now()
-    current_time = now.time()
+    try:
+        stocks = build_scanner()
 
-    data, error = get_nse_preopen()
+        if stocks:
+            message = (
+                f"Yahoo Finance India Equity data received. "
+                f"{len(stocks)} positive Gap-Up stocks found. "
+                f"Gap % घटते क्रम में है."
+            )
 
-    if error:
+            return render_template_string(
+                HTML,
+                stocks=stocks,
+                error=None,
+                message=message
+            )
+
         return render_template_string(
             HTML,
             stocks=[],
-            error=error,
+            error=None,
+            message=(
+                "Data received, लेकिन 1% या उससे अधिक "
+                "positive Gap-Up वाला stock नहीं मिला."
+            )
+        )
+
+    except Exception as e:
+
+        return render_template_string(
+            HTML,
+            stocks=[],
+            error=str(e),
             message=None
         )
 
-    stocks = parse_preopen(data)
-
-    if stocks:
-        message = (
-            f"NSE data received. "
-            f"{len(stocks)} qualifying stocks found. "
-            f"Gap % घटते क्रम में है."
-        )
-    else:
-        message = (
-            "NSE response मिला, लेकिन इस समय "
-            "Pre-Open qualifying data उपलब्ध नहीं है. "
-            "Pre-Open session 9:00–9:15 AM में होती है."
-        )
-
-    return render_template_string(
-        HTML,
-        stocks=stocks,
-        error=None,
-        message=message
-    )
-
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+
+    port = int(
+        os.environ.get("PORT", 10000)
+    )
 
     app.run(
         host="0.0.0.0",
