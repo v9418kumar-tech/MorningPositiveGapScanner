@@ -1,4 +1,6 @@
-# Time frame: NSE Pre-Open 9:08-9:09 AM + Previous 20 Trading Days
+# Time frame: Daily / Pre-Open
+
 flask
 requests
 gunicorn
+pandas
