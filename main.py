@@ -1,136 +1,131 @@
-# Time frame: Daily / Full Day Opening Gap Scanner
+# Time frame: Daily / Pre-Open Opening Gap
+# Test mode: Today's Open vs Previous Close
+# Morning mode: Pre-open data after approximately 9:08 AM
 
 from flask import Flask, render_template_string
-import yfinance as yf
+import requests
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import os
+import time
 
 app = Flask(__name__)
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json,text/plain,*/*",
+    "Referer": "https://www.nseindia.com/"
+}
+
+NSE_UNIVERSE_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
+
+MIN_PRICE = 20
+MIN_GAP = 1.0
+MIN_TURNOVER = 100000000
+
 HTML = """
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Morning Positive Gap Scanner</title>
-
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background: #f5f5f5;
-        }
-
-        h1 {
-            margin-bottom: 5px;
-        }
-
-        .info {
-            margin-bottom: 15px;
-            font-size: 16px;
-        }
-
-        .error {
-            background: #ffe0e0;
-            border: 1px solid #cc0000;
-            padding: 12px;
-            margin: 15px 0;
-            color: #900;
-            border-radius: 6px;
-        }
-
-        .success {
-            background: #e2f5e2;
-            border: 1px solid #339933;
-            padding: 10px;
-            margin: 15px 0;
-            border-radius: 6px;
-        }
-
-        button {
-            padding: 10px 18px;
-            font-size: 16px;
-            cursor: pointer;
-            margin-bottom: 15px;
-        }
-
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            background: white;
-        }
-
-        th, td {
-            border: 1px solid #ccc;
-            padding: 8px;
-            text-align: center;
-        }
-
-        th {
-            background: #eeeeee;
-        }
-
-        tr:nth-child(even) {
-            background: #fafafa;
-        }
-
-        .gap {
-            font-weight: bold;
-        }
-    </style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Morning Positive Gap Scanner</title>
+<style>
+body {
+    font-family: Arial, sans-serif;
+    margin: 15px;
+    background: #f5f5f5;
+}
+h2 {
+    margin-bottom: 5px;
+}
+.info {
+    background: white;
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 12px;
+}
+button {
+    padding: 10px 16px;
+    font-size: 16px;
+    border: 0;
+    border-radius: 6px;
+    cursor: pointer;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    margin-top: 12px;
+}
+th, td {
+    padding: 8px;
+    border: 1px solid #ddd;
+    text-align: center;
+    white-space: nowrap;
+}
+th {
+    background: #eeeeee;
+}
+.gap {
+    font-weight: bold;
+}
+.small {
+    font-size: 13px;
+    color: #555;
+}
+</style>
 </head>
-
 <body>
 
-<h1>🚀 MORNING POSITIVE GAP</h1>
+<h2>Morning Positive Gap Scanner</h2>
 
 <div class="info">
-    <b>Time frame:</b> Daily / Full Day Opening Gap
+<b>Calculation:</b>
+(Open - Previous Close) / Previous Close × 100
+<br>
+<b>Filters:</b>
+Price &gt; ₹20 | Gap-Up ≥ 1% | Approx. turnover &gt; ₹10 crore
+<br>
+<span class="small">
+Scanner uses today's Open and Previous Close for historical testing.
+</span>
 </div>
 
-<form>
-    <button type="submit">🔄 Refresh Scanner</button>
+<form method="get">
+<button type="submit">Refresh Scanner</button>
 </form>
 
-{% if error %}
-<div class="error">
-    <b>Scanner Error:</b><br>
-    {{ error }}
-</div>
-{% endif %}
-
 {% if message %}
-<div class="success">
-    {{ message }}
-</div>
+<div class="info">{{ message }}</div>
 {% endif %}
 
-{% if stocks %}
+{% if rows %}
 <table>
-    <thead>
-        <tr>
-            <th>Sr.</th>
-            <th>Stock Name</th>
-            <th>Symbol</th>
-            <th>Gap %</th>
-            <th>Open</th>
-            <th>Prev Close</th>
-        </tr>
-    </thead>
+<tr>
+<th>Sr.</th>
+<th>Stock Name</th>
+<th>Symbol</th>
+<th>Gap %</th>
+<th>Open</th>
+<th>Previous Close</th>
+<th>20D Avg Volume</th>
+<th>Turnover</th>
+</tr>
 
-    <tbody>
-    {% for stock in stocks %}
-        <tr>
-            <td>{{ loop.index }}</td>
-            <td>{{ stock.name }}</td>
-            <td>{{ stock.symbol }}</td>
-            <td class="gap">
-                {{ "%.2f"|format(stock.gap) }}%
-            </td>
-            <td>{{ "%.2f"|format(stock.open) }}</td>
-            <td>{{ "%.2f"|format(stock.prev_close) }}</td>
-        </tr>
-    {% endfor %}
-    </tbody>
+{% for r in rows %}
+<tr>
+<td>{{ loop.index }}</td>
+<td>{{ r.name }}</td>
+<td>{{ r.symbol }}</td>
+<td class="gap">+{{ "%.2f"|format(r.gap) }}%</td>
+<td>₹{{ "%.2f"|format(r.open) }}</td>
+<td>₹{{ "%.2f"|format(r.prev_close) }}</td>
+<td>{{ "{:,.0f}".format(r.avg_volume) }}</td>
+<td>₹{{ "{:,.0f}".format(r.turnover) }}</td>
+</tr>
+{% endfor %}
 </table>
 {% endif %}
 
@@ -139,146 +134,219 @@ HTML = """
 """
 
 
-def get_indian_equities():
+def get_universe():
     """
-    Time frame: Daily / India Equity
-    Yahoo Finance India equity screener.
+    NSE Equity universe.
+    ETF symbols are excluded where possible using SERIES = EQ.
     """
+    try:
+        r = requests.get(
+            NSE_UNIVERSE_URL,
+            headers=HEADERS,
+            timeout=20
+        )
+        r.raise_for_status()
 
-    query = yf.EquityQuery(
-        "and",
-        [
-            yf.EquityQuery("eq", ["region", "in"]),
-            yf.EquityQuery("eq", ["exchange", "NSI"]),
-            yf.EquityQuery("gt", ["intradayprice", 20])
+        df = pd.read_csv(
+            pd.io.common.StringIO(r.text)
+        )
+
+        df.columns = [str(c).strip().upper() for c in df.columns]
+
+        symbol_col = None
+        name_col = None
+        series_col = None
+
+        for c in df.columns:
+            if c == "SYMBOL":
+                symbol_col = c
+            if c in ["NAME OF COMPANY", "NAME_OF_COMPANY"]:
+                name_col = c
+            if c == "SERIES":
+                series_col = c
+
+        if not symbol_col:
+            return []
+
+        if series_col:
+            df = df[df[series_col].astype(str).str.upper() == "EQ"]
+
+        result = []
+
+        for _, row in df.iterrows():
+            symbol = str(row[symbol_col]).strip().upper()
+
+            if not symbol or symbol == "NAN":
+                continue
+
+            name = symbol
+            if name_col:
+                name = str(row[name_col]).strip()
+
+            result.append({
+                "symbol": symbol,
+                "name": name
+            })
+
+        return result
+
+    except Exception:
+        return []
+
+
+def get_yahoo_data(stock):
+    symbol = stock["symbol"]
+    yahoo_symbol = symbol + ".NS"
+
+    try:
+        url = YAHOO_URL + yahoo_symbol
+
+        params = {
+            "range": "1mo",
+            "interval": "1d",
+            "events": "history"
+        }
+
+        r = requests.get(
+            url,
+            params=params,
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            },
+            timeout=12
+        )
+
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+
+        result = data.get("chart", {}).get("result")
+
+        if not result:
+            return None
+
+        result = result[0]
+        quote = result.get("indicators", {}).get("quote", [{}])[0]
+
+        opens = quote.get("open", [])
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
+
+        clean = []
+
+        for o, c, v in zip(opens, closes, volumes):
+            if o is not None and c is not None:
+                clean.append({
+                    "open": float(o),
+                    "close": float(c),
+                    "volume": float(v or 0)
+                })
+
+        if len(clean) < 2:
+            return None
+
+        today = clean[-1]
+        previous = clean[-2]
+
+        open_price = today["open"]
+        prev_close = previous["close"]
+
+        if prev_close <= 0 or open_price <= 0:
+            return None
+
+        gap = ((open_price - prev_close) / prev_close) * 100
+
+        volumes_only = [
+            x["volume"] for x in clean[:-1]
+            if x["volume"] is not None
         ]
-    )
 
-    result = yf.screen(
-        query,
-        offset=0,
-        size=250,
-        sortField="dayvolume",
-        sortAsc=False
-    )
+        last_20 = volumes_only[-20:]
 
-    return result.get("quotes", [])
+        if not last_20:
+            avg_volume = 0
+        else:
+            avg_volume = sum(last_20) / len(last_20)
 
+        turnover = open_price * avg_volume
 
-def build_scanner():
-    """
-    Time frame: Daily / Full Day Opening Gap
-    """
+        if open_price <= MIN_PRICE:
+            return None
 
-    quotes = get_indian_equities()
+        if gap < MIN_GAP:
+            return None
 
-    stocks = []
+        if turnover < MIN_TURNOVER:
+            return None
 
-    for q in quotes:
-
-        symbol = q.get("symbol")
-
-        if not symbol:
-            continue
-
-        # Equity only
-        if q.get("quoteType", "").upper() != "EQUITY":
-            continue
-
-        open_price = q.get("regularMarketOpen")
-        prev_close = q.get("regularMarketPreviousClose")
-
-        if open_price is None or prev_close is None:
-            continue
-
-        try:
-            open_price = float(open_price)
-            prev_close = float(prev_close)
-        except (TypeError, ValueError):
-            continue
-
-        if open_price <= 20:
-            continue
-
-        if prev_close <= 0:
-            continue
-
-        gap = (
-            (open_price - prev_close)
-            / prev_close
-        ) * 100
-
-        # Positive gap only
-        if gap < 1:
-            continue
-
-        stocks.append({
-            "name": (
-                q.get("longName")
-                or q.get("shortName")
-                or symbol
-            ),
-            "symbol": symbol.replace(".NS", ""),
+        return {
+            "name": stock["name"],
+            "symbol": symbol,
             "gap": gap,
             "open": open_price,
-            "prev_close": prev_close
-        })
+            "prev_close": prev_close,
+            "avg_volume": avg_volume,
+            "turnover": turnover
+        }
 
-    # Gap % descending
-    stocks.sort(
+    except Exception:
+        return None
+
+
+def scan():
+    universe = get_universe()
+
+    if not universe:
+        return [], "NSE equity list could not be downloaded."
+
+    rows = []
+
+    # Moderate number of parallel requests to avoid excessive load.
+    with ThreadPoolExecutor(max_workers=10) as executor:
+
+        futures = [
+            executor.submit(get_yahoo_data, stock)
+            for stock in universe
+        ]
+
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+
+                if result:
+                    rows.append(result)
+
+            except Exception:
+                pass
+
+    rows.sort(
         key=lambda x: x["gap"],
         reverse=True
     )
 
-    return stocks
+    message = (
+        "Historical test: today's Open vs Previous Close. "
+        "Results sorted by highest Positive Gap."
+    )
+
+    return rows, message
 
 
 @app.route("/")
-def scanner():
+def home():
 
-    try:
-        stocks = build_scanner()
+    rows, message = scan()
 
-        if stocks:
-            message = (
-                f"Yahoo Finance India Equity data received. "
-                f"{len(stocks)} positive Gap-Up stocks found. "
-                f"Gap % घटते क्रम में है."
-            )
-
-            return render_template_string(
-                HTML,
-                stocks=stocks,
-                error=None,
-                message=message
-            )
-
-        return render_template_string(
-            HTML,
-            stocks=[],
-            error=None,
-            message=(
-                "Data received, लेकिन 1% या उससे अधिक "
-                "positive Gap-Up वाला stock नहीं मिला."
-            )
-        )
-
-    except Exception as e:
-
-        return render_template_string(
-            HTML,
-            stocks=[],
-            error=str(e),
-            message=None
-        )
+    return render_template_string(
+        HTML,
+        rows=rows,
+        message=message
+    )
 
 
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get("PORT", 10000)
-    )
-
+    port = int(os.environ.get("PORT", 10000))
     app.run(
         host="0.0.0.0",
         port=port
