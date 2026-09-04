@@ -1,4 +1,5 @@
 # Time frame: Daily Historical Liquidity + NSE Pre-Open
+# NSE EQ series only - BE and ETF excluded
 
 from flask import Flask, render_template_string
 import requests
@@ -46,7 +47,6 @@ liquidity_cache = {}
 liquidity_cache_date = None
 
 cache_lock = threading.Lock()
-
 
 # ============================================================
 # HTML
@@ -160,7 +160,9 @@ HTML = """
 
         <b>Conditions:</b><br>
 
-        NSE Equity only<br>
+        NSE Equity only — EQ Series<br>
+
+        BE Series excluded<br>
 
         ETF excluded<br>
 
@@ -258,6 +260,11 @@ HTML = """
 
         Historical liquidity uses previous
         completed trading days only.
+
+        <br>
+
+        Only NSE Series EQ is included.
+        BE and ETF are excluded.
 
     </div>
 
@@ -360,6 +367,137 @@ def get_etf_symbols():
 
 
 # ============================================================
+# NSE EQ SERIES SYMBOLS
+# ============================================================
+# This function reads the latest available NSE Bhavcopy
+# and keeps ONLY Series = EQ.
+#
+# Therefore:
+# EQ  -> INCLUDED
+# BE  -> EXCLUDED
+# SM  -> EXCLUDED
+# ST  -> EXCLUDED
+# ETF -> separately excluded
+# ============================================================
+
+def get_eq_symbols():
+
+    today = datetime.now().date()
+
+    for days_back in range(1, 11):
+
+        date_obj = (
+            today
+            - timedelta(days=days_back)
+        )
+
+        # Weekend skip
+        if date_obj.weekday() >= 5:
+            continue
+
+        date_str = date_obj.strftime(
+            "%d%m%Y"
+        )
+
+        url = NSE_BHAV_URL.format(
+            date_str
+        )
+
+        try:
+
+            s = nse_session()
+
+            r = s.get(
+                url,
+                timeout=20
+            )
+
+            if r.status_code != 200:
+                continue
+
+            if not r.text.strip():
+                continue
+
+            df = pd.read_csv(
+                StringIO(r.text)
+            )
+
+            df.columns = [
+                str(c).strip().upper()
+                for c in df.columns
+            ]
+
+            symbol_col = find_column(
+                df,
+                ["SYMBOL"]
+            )
+
+            series_col = find_column(
+                df,
+                ["SERIES"]
+            )
+
+            if (
+                symbol_col is None
+                or series_col is None
+            ):
+                continue
+
+            df[symbol_col] = (
+                df[symbol_col]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+
+            df[series_col] = (
+                df[series_col]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+
+            eq_df = df[
+                df[series_col] == "EQ"
+            ]
+
+            symbols = set(
+                eq_df[symbol_col]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+
+            symbols = {
+                x for x in symbols
+                if x
+                and x != "NAN"
+            }
+
+            if symbols:
+
+                print(
+                    f"Loaded {len(symbols)} "
+                    f"NSE EQ symbols from "
+                    f"{date_obj}"
+                )
+
+                return symbols
+
+        except Exception as e:
+
+            print(
+                f"EQ series lookup error "
+                f"for {date_obj}: {e}"
+            )
+
+            continue
+
+    return set()
+
+
+# ============================================================
 # NSE Pre-Open
 # ============================================================
 
@@ -459,7 +597,6 @@ def download_one_bhavcopy(
         if not r.text.strip():
             return None
 
-        # Read only necessary columns.
         df = pd.read_csv(
             StringIO(r.text)
         )
@@ -502,8 +639,6 @@ def download_one_bhavcopy(
 
         result = {}
 
-        # Only process symbols that can
-        # possibly pass today's pre-open.
         if required_symbols:
 
             df[symbol_col] = (
@@ -630,7 +765,6 @@ def get_candidate_dates():
         - timedelta(days=1)
     )
 
-    # Maximum 35 calendar weekdays.
     while len(dates) < 30:
 
         if d.weekday() < 5:
@@ -655,10 +789,6 @@ def build_liquidity_cache(
 
     today = datetime.now().date()
 
-    # --------------------------------------------------------
-    # Use today's existing cache.
-    # --------------------------------------------------------
-
     with cache_lock:
 
         if (
@@ -668,16 +798,10 @@ def build_liquidity_cache(
 
             return liquidity_cache
 
-    # --------------------------------------------------------
-    # Download historical data.
-    # --------------------------------------------------------
-
     dates = get_candidate_dates()
 
     daily_data = []
 
-    # Use only 4 workers to reduce CPU pressure
-    # on Render Free.
     with ThreadPoolExecutor(
         max_workers=4
     ) as executor:
@@ -708,18 +832,9 @@ def build_liquidity_cache(
                         result
                     )
 
-                    # Once 20 valid days
-                    # are available, remaining
-                    # requests may still finish,
-                    # but we only keep 20 below.
-
             except Exception:
 
                 pass
-
-    # --------------------------------------------------------
-    # Keep latest 20 successful trading days.
-    # --------------------------------------------------------
 
     daily_data = sorted(
         daily_data,
@@ -738,10 +853,6 @@ def build_liquidity_cache(
             f"trading days available. "
             f"Need {LIQUIDITY_DAYS}."
         )
-
-    # --------------------------------------------------------
-    # Calculate average turnover.
-    # --------------------------------------------------------
 
     turnover_sum = {}
     turnover_count = {}
@@ -774,18 +885,12 @@ def build_liquidity_cache(
             symbol
         ]
 
-        # Symbol must have data for
-        # all 20 selected trading days.
         if count == LIQUIDITY_DAYS:
 
             avg_turnover[symbol] = (
                 turnover_sum[symbol]
                 / count
             )
-
-    # --------------------------------------------------------
-    # Save today's cache.
-    # --------------------------------------------------------
 
     with cache_lock:
 
@@ -923,16 +1028,34 @@ def run_scanner():
     )
 
     # --------------------------------------------------------
-    # 2. Apply quick filters first.
+    # 2. Get ONLY NSE EQ series.
+    # --------------------------------------------------------
+
+    eq_symbols = get_eq_symbols()
+
+    if not eq_symbols:
+
+        raise Exception(
+            "NSE EQ Series list could not be loaded."
+        )
+
+    # --------------------------------------------------------
+    # 3. Apply quick filters.
     # --------------------------------------------------------
 
     candidate_rows = []
 
     for row in parsed:
 
+        # ONLY Series EQ
+        if row["symbol"] not in eq_symbols:
+            continue
+
+        # Price > ₹20
         if row["open"] <= MIN_PRICE:
             continue
 
+        # Gap >= 1%
         if row["gap"] < MIN_GAP:
             continue
 
@@ -944,7 +1067,7 @@ def run_scanner():
         return []
 
     # --------------------------------------------------------
-    # 3. Get ETF symbols.
+    # 4. ETF exclusion.
     # --------------------------------------------------------
 
     etfs = get_etf_symbols()
@@ -959,8 +1082,7 @@ def run_scanner():
         return []
 
     # --------------------------------------------------------
-    # 4. Historical liquidity.
-    #    Only candidate symbols are processed.
+    # 5. Historical liquidity.
     # --------------------------------------------------------
 
     required_symbols = {
@@ -975,7 +1097,7 @@ def run_scanner():
     )
 
     # --------------------------------------------------------
-    # 5. Final ₹10 crore liquidity filter.
+    # 6. Final ₹10 crore liquidity filter.
     # --------------------------------------------------------
 
     results = []
@@ -1018,7 +1140,7 @@ def run_scanner():
         })
 
     # --------------------------------------------------------
-    # 6. Highest Gap first.
+    # 7. Highest Gap first.
     # --------------------------------------------------------
 
     results.sort(
@@ -1027,7 +1149,7 @@ def run_scanner():
     )
 
     # --------------------------------------------------------
-    # 7. Rank.
+    # 8. Rank.
     # --------------------------------------------------------
 
     for i, row in enumerate(
