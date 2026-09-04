@@ -1,4 +1,4 @@
-# Time frame: Daily Historical Liquidity + NSE Pre-Open
+# Morning Positive Gap Scanner
 # NSE EQ series only - BE and ETF excluded
 
 from flask import Flask, render_template_string
@@ -12,319 +12,240 @@ import time
 
 app = Flask(__name__)
 
-# ============================================================
-# NSE URLs
-# ============================================================
-
-NSE_PREOPEN_URL = (
-    "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
-)
-
-NSE_ETF_URL = (
-    "https://nsearchives.nseindia.com/"
-    "content/equities/eq_etfseclist.csv"
-)
-
-NSE_BHAV_URL = (
-    "https://nsearchives.nseindia.com/products/"
-    "content/sec_bhavdata_full_{}.csv"
-)
-
-# ============================================================
-# Scanner Conditions
-# ============================================================
+NSE_PREOPEN_URL = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
+NSE_ETF_URL = "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv"
+NSE_BHAV_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{}.csv"
 
 MIN_PRICE = 20
 MIN_GAP = 1.0
-MIN_AVG_TURNOVER = 100000000      # ₹10 crore
+MIN_AVG_TURNOVER = 100000000
 LIQUIDITY_DAYS = 20
-
-# ============================================================
-# Daily In-Memory Cache
-# ============================================================
 
 liquidity_cache = {}
 liquidity_cache_date = None
-
 cache_lock = threading.Lock()
-
-# ============================================================
-# HTML
-# ============================================================
 
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
+<title>Morning Positive Gap Scanner</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 
-    <title>Morning Positive Gap Scanner</title>
+<style>
+body{
+    background:#121212;
+    color:#eee;
+    font-family:Arial,sans-serif;
+    margin:0;
+    padding:12px;
+}
 
-    <meta name="viewport"
-          content="width=device-width, initial-scale=1">
+.container{
+    max-width:1100px;
+    margin:auto;
+}
 
-    <style>
+h1{
+    font-size:22px;
+    margin:5px 0 10px;
+}
 
-        body {
-            background:#121212;
-            color:#eeeeee;
-            font-family:Arial,sans-serif;
-            margin:0;
-            padding:20px;
-        }
+.info{
+    background:#1e1e1e;
+    padding:11px;
+    border-radius:8px;
+    margin-bottom:12px;
+    line-height:1.45;
+    font-size:14px;
+}
 
-        .container {
-            max-width:1100px;
-            margin:auto;
-        }
+button{
+    background:#333;
+    color:white;
+    border:1px solid #555;
+    padding:11px 20px;
+    border-radius:7px;
+    font-size:16px;
+    margin-bottom:12px;
+}
 
-        h1 {
-            font-size:24px;
-            margin-bottom:8px;
-        }
+.status{
+    margin-bottom:10px;
+    font-size:14px;
+}
 
-        .info {
-            background:#1e1e1e;
-            padding:14px;
-            border-radius:8px;
-            margin-bottom:15px;
-            line-height:1.6;
-        }
+.table-wrap{
+    overflow-x:auto;
+}
 
-        button {
-            background:#333333;
-            color:white;
-            border:1px solid #555;
-            padding:13px 22px;
-            border-radius:7px;
-            font-size:16px;
-            cursor:pointer;
-            margin-bottom:18px;
-        }
+table{
+    width:100%;
+    border-collapse:collapse;
+    background:#1a1a1a;
+    font-size:13px;
+}
 
-        button:hover {
-            background:#444444;
-        }
+th{
+    background:#252525;
+    padding:8px 5px;
+    text-align:center;
+    white-space:nowrap;
+}
 
-        .status {
-            margin-bottom:15px;
-            font-size:15px;
-        }
+td{
+    padding:8px 5px;
+    border-bottom:1px solid #333;
+    text-align:center;
+    white-space:nowrap;
+}
 
-        .table-wrap {
-            overflow-x:auto;
-        }
+.gap{
+    color:#00d26a;
+    font-weight:bold;
+}
 
-        table {
-            width:100%;
-            border-collapse:collapse;
-            background:#1a1a1a;
-        }
-
-        th {
-            background:#252525;
-            padding:11px 8px;
-            text-align:center;
-            white-space:nowrap;
-        }
-
-        td {
-            padding:10px 8px;
-            border-bottom:1px solid #333;
-            text-align:center;
-            white-space:nowrap;
-        }
-
-        .gap {
-            color:#00d26a;
-            font-weight:bold;
-        }
-
-        .note {
-            color:#aaaaaa;
-            font-size:13px;
-            margin-top:15px;
-            line-height:1.6;
-        }
-
-    </style>
-
+.note{
+    color:#aaa;
+    font-size:12px;
+    margin-top:12px;
+    line-height:1.5;
+}
+</style>
 </head>
 
 <body>
-
 <div class="container">
 
-    <h1>Morning Positive Gap Scanner</h1>
+<h1>Morning Positive Gap Scanner</h1>
 
-    <div class="info">
-
-        <b>Conditions:</b><br>
-
-        NSE Equity only — EQ Series<br>
-
-        BE Series excluded<br>
-
-        ETF excluded<br>
-
-        Opening Price &gt; ₹20<br>
-
-        Opening Gap ≥ 1%<br>
-
-        Previous 20 valid trading days average
-        real turnover &gt; ₹10 crore<br>
-
-        Results sorted by highest Gap %
-
-    </div>
-
-    <form action="/scan" method="get">
-
-        <button type="submit">
-            RUN SCANNER
-        </button>
-
-    </form>
-
-    {% if status %}
-
-        <div class="status">
-            {{ status }}
-        </div>
-
-    {% endif %}
-
-    {% if rows %}
-
-    <div class="table-wrap">
-
-        <table>
-
-            <tr>
-                <th>Rank</th>
-                <th>Stock</th>
-                <th>Symbol</th>
-                <th>Gap %</th>
-                <th>Opening Price</th>
-                <th>Previous Close</th>
-                <th>20D Avg Turnover</th>
-            </tr>
-
-            {% for r in rows %}
-
-            <tr>
-
-                <td>{{ r.rank }}</td>
-
-                <td>{{ r.name }}</td>
-
-                <td>{{ r.symbol }}</td>
-
-                <td class="gap">
-                    {{ "%.2f"|format(r.gap) }}%
-                </td>
-
-                <td>
-                    ₹{{ "%.2f"|format(r.open) }}
-                </td>
-
-                <td>
-                    ₹{{ "%.2f"|format(r.prev_close) }}
-                </td>
-
-                <td>
-                    ₹{{ "{:,.0f}".format(r.avg_turnover) }}
-                </td>
-
-            </tr>
-
-            {% endfor %}
-
-        </table>
-
-    </div>
-
-    {% endif %}
-
-    <div class="note">
-
-        Opening Gap =
-        (Opening Price − Previous Close)
-        ÷ Previous Close × 100.
-
-        <br>
-
-        Today's Close is NOT used for the
-        Opening Gap calculation.
-
-        <br>
-
-        Historical liquidity uses previous
-        completed trading days only.
-
-        <br>
-
-        Only NSE Series EQ is included.
-        BE and ETF are excluded.
-
-    </div>
-
+<div class="info">
+<b>Conditions:</b><br>
+NSE Equity only — EQ Series<br>
+BE Series excluded<br>
+ETF excluded<br>
+Opening Price &gt; ₹20<br>
+Opening Gap ≥ 1%<br>
+Previous 20 valid trading days average real turnover &gt; ₹10 crore<br>
+Results sorted by highest Gap %
 </div>
 
+<form action="/scan" method="get">
+<button type="submit">RUN SCANNER</button>
+</form>
+
+{% if status %}
+<div class="status">{{ status }}</div>
+{% endif %}
+
+{% if rows %}
+<div class="table-wrap">
+<table>
+
+<tr>
+<th>Rank</th>
+<th>Symbol</th>
+<th>Gap %</th>
+<th>Open</th>
+<th>Prev Close</th>
+<th>20D Avg</th>
+</tr>
+
+{% for r in rows %}
+<tr>
+
+<td>{{ r.rank }}</td>
+
+<td><b>{{ r.symbol }}</b></td>
+
+<td class="gap">
+{{ "%.2f"|format(r.gap) }}%
+</td>
+
+<td>
+₹{{ "%.2f"|format(r.open) }}
+</td>
+
+<td>
+₹{{ "%.2f"|format(r.prev_close) }}
+</td>
+
+<td>
+₹{{ "{:,.0f}".format(r.avg_turnover) }}
+</td>
+
+</tr>
+{% endfor %}
+
+</table>
+</div>
+{% endif %}
+
+<div class="note">
+Opening Gap =
+(Opening Price − Previous Close) ÷ Previous Close × 100.
+<br>
+Today's Close is NOT used for the Opening Gap calculation.
+<br>
+Historical liquidity uses previous completed trading days only.
+<br>
+Only NSE Series EQ is included. BE and ETF are excluded.
+</div>
+
+</div>
 </body>
 </html>
 """
 
 
-# ============================================================
-# NSE Session
-# ============================================================
-
 def nse_session():
-
     session = requests.Session()
 
     session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/139.0 Safari/537.36"
-        ),
+        "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/139.0 Safari/537.36",
 
         "Accept":
-            "application/json,text/plain,*/*",
+        "application/json,text/plain,*/*",
 
         "Accept-Language":
-            "en-US,en;q=0.9",
+        "en-US,en;q=0.9",
 
         "Referer":
-            "https://www.nseindia.com/",
+        "https://www.nseindia.com/",
 
         "Connection":
-            "keep-alive"
+        "keep-alive"
     })
 
     try:
-
         session.get(
             "https://www.nseindia.com/",
             timeout=8
         )
-
     except Exception:
         pass
 
     return session
 
 
-# ============================================================
-# ETF List
-# ============================================================
+def find_column(df, names):
+    lower_map = {
+        str(c).strip().lower(): c
+        for c in df.columns
+    }
+
+    for name in names:
+        if name.lower() in lower_map:
+            return lower_map[name.lower()]
+
+    return None
+
 
 def get_etf_symbols():
-
     try:
-
         s = nse_session()
 
         r = s.get(
@@ -335,13 +256,11 @@ def get_etf_symbols():
         if r.status_code != 200:
             return set()
 
-        text = r.text.strip()
-
-        if not text:
+        if not r.text.strip():
             return set()
 
         df = pd.read_csv(
-            StringIO(text)
+            StringIO(r.text)
         )
 
         symbols = set()
@@ -362,23 +281,8 @@ def get_etf_symbols():
         return symbols
 
     except Exception:
-
         return set()
 
-
-# ============================================================
-# NSE EQ SERIES SYMBOLS
-# ============================================================
-# This function reads the latest available NSE Bhavcopy
-# and keeps ONLY Series = EQ.
-#
-# Therefore:
-# EQ  -> INCLUDED
-# BE  -> EXCLUDED
-# SM  -> EXCLUDED
-# ST  -> EXCLUDED
-# ETF -> separately excluded
-# ============================================================
 
 def get_eq_symbols():
 
@@ -387,11 +291,10 @@ def get_eq_symbols():
     for days_back in range(1, 11):
 
         date_obj = (
-            today
-            - timedelta(days=days_back)
+            today -
+            timedelta(days=days_back)
         )
 
-        # Weekend skip
         if date_obj.weekday() >= 5:
             continue
 
@@ -471,35 +374,17 @@ def get_eq_symbols():
 
             symbols = {
                 x for x in symbols
-                if x
-                and x != "NAN"
+                if x and x != "NAN"
             }
 
             if symbols:
-
-                print(
-                    f"Loaded {len(symbols)} "
-                    f"NSE EQ symbols from "
-                    f"{date_obj}"
-                )
-
                 return symbols
 
-        except Exception as e:
-
-            print(
-                f"EQ series lookup error "
-                f"for {date_obj}: {e}"
-            )
-
+        except Exception:
             continue
 
     return set()
 
-
-# ============================================================
-# NSE Pre-Open
-# ============================================================
 
 def get_preopen_data():
 
@@ -517,7 +402,6 @@ def get_preopen_data():
             )
 
             if r.status_code != 200:
-
                 raise Exception(
                     f"NSE HTTP {r.status_code}"
                 )
@@ -525,7 +409,6 @@ def get_preopen_data():
             data = r.json()
 
             if "data" not in data:
-
                 raise Exception(
                     "NSE pre-open data missing"
                 )
@@ -535,39 +418,12 @@ def get_preopen_data():
         except Exception as e:
 
             last_error = e
-
             time.sleep(1)
 
     raise Exception(
         f"NSE Pre-Open failed: {last_error}"
     )
 
-
-# ============================================================
-# Column Finder
-# ============================================================
-
-def find_column(df, possible_names):
-
-    lower_map = {
-        str(c).strip().lower(): c
-        for c in df.columns
-    }
-
-    for name in possible_names:
-
-        if name.lower() in lower_map:
-
-            return lower_map[
-                name.lower()
-            ]
-
-    return None
-
-
-# ============================================================
-# Download One Bhavcopy
-# ============================================================
 
 def download_one_bhavcopy(
     date_obj,
@@ -629,15 +485,14 @@ def download_one_bhavcopy(
         if symbol_col is None:
             return None
 
-        if turnover_col is None:
-
-            if (
+        if (
+            turnover_col is None
+            and (
                 close_col is None
                 or volume_col is None
-            ):
-                return None
-
-        result = {}
+            )
+        ):
+            return None
 
         if required_symbols:
 
@@ -654,18 +509,42 @@ def download_one_bhavcopy(
                 )
             ]
 
+        result = {}
+
+        symbol_index = df.columns.get_loc(
+            symbol_col
+        )
+
+        turnover_index = (
+            df.columns.get_loc(
+                turnover_col
+            )
+            if turnover_col is not None
+            else None
+        )
+
+        close_index = (
+            df.columns.get_loc(
+                close_col
+            )
+            if close_col is not None
+            else None
+        )
+
+        volume_index = (
+            df.columns.get_loc(
+                volume_col
+            )
+            if volume_col is not None
+            else None
+        )
+
         for row in df.itertuples(
             index=False,
             name=None
         ):
 
             try:
-
-                symbol_index = (
-                    df.columns.get_loc(
-                        symbol_col
-                    )
-                )
 
                 symbol = str(
                     row[symbol_index]
@@ -674,49 +553,25 @@ def download_one_bhavcopy(
                 if not symbol:
                     continue
 
-                if turnover_col is not None:
-
-                    turnover_index = (
-                        df.columns.get_loc(
-                            turnover_col
-                        )
-                    )
+                if turnover_index is not None:
 
                     turnover = float(
                         str(
-                            row[
-                                turnover_index
-                            ]
+                            row[turnover_index]
                         ).replace(",", "")
                     )
 
                 else:
 
-                    close_index = (
-                        df.columns.get_loc(
-                            close_col
-                        )
-                    )
-
-                    volume_index = (
-                        df.columns.get_loc(
-                            volume_col
-                        )
-                    )
-
                     close = float(
                         str(
-                            row[
-                                close_index
-                            ]
+                            row[close_index]
                         ).replace(",", "")
                     )
 
                     volume = float(
                         str(
-                            row[
-                                volume_index
-                            ]
+                            row[volume_index]
                         ).replace(",", "")
                     )
 
@@ -725,13 +580,9 @@ def download_one_bhavcopy(
                     )
 
                 if turnover > 0:
-
-                    result[
-                        symbol
-                    ] = turnover
+                    result[symbol] = turnover
 
             except Exception:
-
                 continue
 
         if not result:
@@ -739,22 +590,15 @@ def download_one_bhavcopy(
 
         return {
             "date":
-                date_obj.strftime(
-                    "%Y-%m-%d"
-                ),
+            date_obj.strftime("%Y-%m-%d"),
 
             "data":
-                result
+            result
         }
 
     except Exception:
-
         return None
 
-
-# ============================================================
-# Previous Trading Dates
-# ============================================================
 
 def get_candidate_dates():
 
@@ -768,17 +612,12 @@ def get_candidate_dates():
     while len(dates) < 30:
 
         if d.weekday() < 5:
-
             dates.append(d)
 
         d -= timedelta(days=1)
 
     return dates
 
-
-# ============================================================
-# Build Historical Liquidity Cache
-# ============================================================
 
 def build_liquidity_cache(
     required_symbols
@@ -795,11 +634,9 @@ def build_liquidity_cache(
             liquidity_cache_date == today
             and liquidity_cache
         ):
-
             return liquidity_cache
 
     dates = get_candidate_dates()
-
     daily_data = []
 
     with ThreadPoolExecutor(
@@ -812,7 +649,6 @@ def build_liquidity_cache(
                 d,
                 required_symbols
             ): d
-
             for d in dates
         }
 
@@ -822,22 +658,15 @@ def build_liquidity_cache(
 
             try:
 
-                result = (
-                    future.result()
-                )
+                result = future.result()
 
                 if result is not None:
-
-                    daily_data.append(
-                        result
-                    )
+                    daily_data.append(result)
 
             except Exception:
-
                 pass
 
-    daily_data = sorted(
-        daily_data,
+    daily_data.sort(
         key=lambda x: x["date"],
         reverse=True
     )
@@ -881,9 +710,7 @@ def build_liquidity_cache(
 
     for symbol in turnover_sum:
 
-        count = turnover_count[
-            symbol
-        ]
+        count = turnover_count[symbol]
 
         if count == LIQUIDITY_DAYS:
 
@@ -894,18 +721,11 @@ def build_liquidity_cache(
 
     with cache_lock:
 
-        liquidity_cache = (
-            avg_turnover
-        )
-
+        liquidity_cache = avg_turnover
         liquidity_cache_date = today
 
     return avg_turnover
 
-
-# ============================================================
-# Parse Pre-Open Data
-# ============================================================
 
 def parse_preopen(data):
 
@@ -941,9 +761,7 @@ def parse_preopen(data):
         previous_close = (
             meta.get("previousClose")
             or meta.get("prevClose")
-            or item.get(
-                "previousClose"
-            )
+            or item.get("previousClose")
         )
 
         opening_price = (
@@ -952,9 +770,7 @@ def parse_preopen(data):
             or meta.get(
                 "indicativeEquilibriumPrice"
             )
-            or trade.get(
-                "finalPrice"
-            )
+            or trade.get("finalPrice")
             or trade.get("iep")
         )
 
@@ -973,13 +789,12 @@ def parse_preopen(data):
             )
 
         except Exception:
-
             continue
 
-        if previous_close <= 0:
-            continue
-
-        if opening_price <= 0:
+        if (
+            previous_close <= 0
+            or opening_price <= 0
+        ):
             continue
 
         gap = (
@@ -991,84 +806,44 @@ def parse_preopen(data):
         ) * 100
 
         rows.append({
-
-            "symbol":
-                symbol,
-
-            "open":
-                opening_price,
-
-            "prev_close":
-                previous_close,
-
-            "gap":
-                gap
-
+            "symbol": symbol,
+            "open": opening_price,
+            "prev_close": previous_close,
+            "gap": gap
         })
 
     return rows
 
 
-# ============================================================
-# Main Scanner
-# ============================================================
-
 def run_scanner():
 
-    # --------------------------------------------------------
-    # 1. Get today's NSE pre-open first.
-    # --------------------------------------------------------
-
-    preopen = (
-        get_preopen_data()
-    )
-
-    parsed = parse_preopen(
-        preopen
-    )
-
-    # --------------------------------------------------------
-    # 2. Get ONLY NSE EQ series.
-    # --------------------------------------------------------
+    preopen = get_preopen_data()
+    parsed = parse_preopen(preopen)
 
     eq_symbols = get_eq_symbols()
 
     if not eq_symbols:
-
         raise Exception(
             "NSE EQ Series list could not be loaded."
         )
-
-    # --------------------------------------------------------
-    # 3. Apply quick filters.
-    # --------------------------------------------------------
 
     candidate_rows = []
 
     for row in parsed:
 
-        # ONLY Series EQ
         if row["symbol"] not in eq_symbols:
             continue
 
-        # Price > ₹20
         if row["open"] <= MIN_PRICE:
             continue
 
-        # Gap >= 1%
         if row["gap"] < MIN_GAP:
             continue
 
-        candidate_rows.append(
-            row
-        )
+        candidate_rows.append(row)
 
     if not candidate_rows:
         return []
-
-    # --------------------------------------------------------
-    # 4. ETF exclusion.
-    # --------------------------------------------------------
 
     etfs = get_etf_symbols()
 
@@ -1081,32 +856,20 @@ def run_scanner():
     if not candidate_rows:
         return []
 
-    # --------------------------------------------------------
-    # 5. Historical liquidity.
-    # --------------------------------------------------------
-
     required_symbols = {
         row["symbol"]
         for row in candidate_rows
     }
 
-    avg_turnover = (
-        build_liquidity_cache(
-            required_symbols
-        )
+    avg_turnover = build_liquidity_cache(
+        required_symbols
     )
-
-    # --------------------------------------------------------
-    # 6. Final ₹10 crore liquidity filter.
-    # --------------------------------------------------------
 
     results = []
 
     for row in candidate_rows:
 
-        symbol = row[
-            "symbol"
-        ]
+        symbol = row["symbol"]
 
         if symbol not in avg_turnover:
             continue
@@ -1118,53 +881,27 @@ def run_scanner():
             continue
 
         results.append({
-
-            "symbol":
-                symbol,
-
-            "name":
-                symbol,
-
-            "gap":
-                row["gap"],
-
-            "open":
-                row["open"],
-
-            "prev_close":
-                row["prev_close"],
-
+            "symbol": symbol,
+            "gap": row["gap"],
+            "open": row["open"],
+            "prev_close": row["prev_close"],
             "avg_turnover":
                 avg_turnover[symbol]
-
         })
-
-    # --------------------------------------------------------
-    # 7. Highest Gap first.
-    # --------------------------------------------------------
 
     results.sort(
         key=lambda x: x["gap"],
         reverse=True
     )
 
-    # --------------------------------------------------------
-    # 8. Rank.
-    # --------------------------------------------------------
-
     for i, row in enumerate(
         results,
         start=1
     ):
-
         row["rank"] = i
 
     return results
 
-
-# ============================================================
-# Home Page
-# ============================================================
 
 @app.route("/")
 def home():
@@ -1176,10 +913,6 @@ def home():
     )
 
 
-# ============================================================
-# Scanner Route
-# ============================================================
-
 @app.route("/scan")
 def scan():
 
@@ -1190,8 +923,7 @@ def scan():
         rows = run_scanner()
 
         elapsed = (
-            time.time()
-            - start
+            time.time() - start
         )
 
         status = (
@@ -1211,25 +943,14 @@ def scan():
         return render_template_string(
             HTML,
             rows=None,
-            status=(
-                f"Scanner error: {e}"
-            )
+            status=f"Scanner error: {e}"
         )
 
 
-# ============================================================
-# Health Check
-# ============================================================
-
 @app.route("/health")
 def health():
-
     return "OK", 200
 
-
-# ============================================================
-# Local Run
-# ============================================================
 
 if __name__ == "__main__":
 
